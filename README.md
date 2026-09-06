@@ -15,14 +15,13 @@ AEGIS is an autonomous, fully-local execution platform engineered to process con
 5. [Ollama Setup](#5-ollama-setup)
 6. [Model Configuration & Registry](#6-model-configuration--registry)
 7. [Running Locally](#7-running-locally)
-8. [Running with Docker & Containerization](#8-running-with-docker--containerization)
-9. [Code Execution Sandbox](#9-code-execution-sandbox)
-10. [Example Workflows & Demonstrations](#10-example-workflows--demonstrations)
-11. [Security Model & Boundary Enforcement](#11-security-model--boundary-enforcement)
-12. [Network Isolation & Real Monitoring](#12-network-isolation--real-monitoring)
-13. [Testing & Verification](#13-testing--verification)
-14. [Troubleshooting](#14-troubleshooting)
-15. [Documentation Index](#15-documentation-index)
+8. [Code Execution Sandbox](#8-code-execution-sandbox)
+9. [Example Workflows & Demonstrations](#9-example-workflows--demonstrations)
+10. [Security Model & Boundary Enforcement](#10-security-model--boundary-enforcement)
+11. [Network Isolation & Real Monitoring](#11-network-isolation--real-monitoring)
+12. [Testing & Verification](#12-testing--verification)
+13. [Troubleshooting](#13-troubleshooting)
+14. [Documentation Index](#14-documentation-index)
 
 ### Clean setup on another system
 
@@ -88,7 +87,7 @@ The system follows a strict layered topology:
                ┌────────────────────┼────────────────────┐
                ▼                    ▼                    ▼
          Deterministic         File Operations      Code Sandbox
-          Calculator          (Path validated)    (Docker Container)
+          Calculator          (Path validated)    (Bounded Subprocess)
                │                    │                    │
                └────────────────────┼────────────────────┘
                                     │
@@ -115,7 +114,6 @@ Security and observability wrap all operations:
   * Minimum: 16 GB RAM, 4-core CPU (for small quantized models, e.g. `llama3.2:1b`)
   * Recommended: 32 GB RAM, Dedicated NVIDIA GPU with 8GB–16GB VRAM (for 7B/8B parameter models)
 * **Ollama:** Version 0.3.0 or higher
-* **Docker:** (Optional, for Phase 2 code sandbox) Docker Engine 24.0+
 
 ### Core Dependencies
 * `langgraph` & `langchain-core`: Graph-based state machine orchestration.
@@ -260,37 +258,18 @@ Inside the CLI prompt (`You ▶`):
 
 ---
 
-## 8. Running with Docker & Containerization
-
-For containerized standalone deployments:
-
-```bash
-# Build the workbench container
-docker build -t sih-workbench:latest .
-
-# Run with host networking to reach Ollama on localhost:11434
-docker run -it --rm \
-  --network host \
-  -v $(pwd)/workspace:/app/workspace \
-  -v $(pwd)/logs:/app/logs \
-  -v $(pwd)/data:/app/data \
-  sih-workbench:latest
-```
-
----
-
-## 9. Code Execution Sandbox
+## 8. Code Execution Sandbox
 
 To satisfy security protocols in industrial and defence environments, generated code is isolated from the host filesystem and OS:
 
-1. **Docker Container Isolation:** Ephemeral containers execute code with `network_disabled=True`.
-2. **Resource Constraints:** Hard ceilings on execution memory (`mem_limit='256m'`) and CPU execution quota.
-3. **Immutable Root:** Container root is mounted `read_only=True`, with writable access restricted to temporary `tmpfs` mounts.
-4. **Dropped Capabilities:** All Linux kernel capabilities dropped (`cap_drop=['ALL']`).
+1. **Process Isolation:** Code executes in an isolated temporary directory with strictly bounded paths and environment variables.
+2. **Resource Constraints:** Hard ceilings on execution memory and strict execution timeout enforcement.
+3. **Restricted Environment:** Writable access is confined to the sandbox directory; system paths and Python bytecode writing are constrained.
+4. **Local Execution:** Code executes locally with complete network isolation.
 
 ---
 
-## 10. Example Workflows & Demonstrations
+## 9. Example Workflows & Demonstrations
 
 ### A. General Knowledge / Policy Inquiry
 ```text
@@ -326,7 +305,7 @@ You ▶ List the files in the workspace and read summary.txt
 
 ---
 
-## 11. Security Model & Boundary Enforcement
+## 10. Security Model & Boundary Enforcement
 
 * **Strict Path Sandboxing:** The [`security/permissions.py`](security/permissions.py) module enforces workspace confinement. Relative path escapes (`../../etc/passwd`), absolute system paths (`/root/`, `/etc/`, `/proc/`), and dangerous write extensions (`.sh`, `.exe`, `.so`) trigger an immediate `PermissionError_`.
 * **Append-Only Audit Logs:** Every task event, tool call, model invocation, and duration is logged to [`logs/audit.jsonl`](logs/audit.jsonl) in structured JSON format. Raw confidential document contents are scrubbed from logs by default.
@@ -334,7 +313,7 @@ You ▶ List the files in the workspace and read summary.txt
 
 ---
 
-## 12. Network Isolation & Real Monitoring
+## 11. Network Isolation & Real Monitoring
 
 To guarantee zero data exfiltration during demonstrations:
 * The [`security/network.py`](security/network.py) module reads real OS network socket tables via `psutil.net_connections(kind="inet")`.
@@ -346,7 +325,7 @@ To guarantee zero data exfiltration during demonstrations:
 
 ---
 
-## 13. Testing & Verification
+## 12. Testing & Verification
 
 The test suite covers routing logic, models, security controls, and tools without requiring a running Ollama daemon:
 
@@ -363,7 +342,7 @@ python -m pytest tests/test_security.py -v  # Path traversal, Audit, Network mon
 
 ---
 
-## 14. Troubleshooting
+## 13. Troubleshooting
 
 | Issue | Root Cause | Resolution |
 | :--- | :--- | :--- |
@@ -375,7 +354,7 @@ python -m pytest tests/test_security.py -v  # Path traversal, Audit, Network mon
 
 ---
 
-## 15. Documentation Index
+## 14. Documentation Index
 
 For in-depth specifications, refer to the documents in the [`docs/`](docs/) directory:
 * [`docs/architecture.md`](docs/architecture.md) — System layers, state machines, and LangGraph flow.
