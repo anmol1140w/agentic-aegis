@@ -262,10 +262,17 @@ Inside the CLI prompt (`You ▶`):
 
 To satisfy security protocols in industrial and defence environments, generated code is isolated from the host filesystem and OS:
 
-1. **Process Isolation:** Code executes in an isolated temporary directory with strictly bounded paths and environment variables.
-2. **Resource Constraints:** Hard ceilings on execution memory and strict execution timeout enforcement.
-3. **Restricted Environment:** Writable access is confined to the sandbox directory; system paths and Python bytecode writing are constrained.
-4. **Local Execution:** Code executes locally with complete network isolation.
+1. **Process Isolation:** Opt-in Bubblewrap and Docker backends isolate the workspace, namespaces, and process group.
+2. **Resource Constraints:** The Docker backend applies memory, CPU, and PID ceilings. Bubblewrap attempts cgroup-v2 memory, CPU-weight, and PID limits when the host permits it; use `AEGIS_CGROUP_MODE=on` to fail closed if those limits cannot be installed (`auto` is the default).
+3. **Restricted Environment:** Writable access is confined to the workspace and sandbox temporary directory; system paths are read-only or hidden.
+4. **Local Execution:** The isolated backends run with networking disabled and all command execution remains approval-gated.
+
+The reusable native API is available through `tools.native_sandbox.NativeSandbox`.
+It keeps a temporary or caller-provided workspace alive across commands, safely
+uploads/downloads relative-path files, and exposes `dry_run()` for reviewing
+the exact Bubblewrap argv before execution. `tools.sandbox_config.SandboxConfig`
+controls memory, PID, CPU-weight, timeout, output, network, GPU, read-only
+binds, and explicitly allowed environment variables.
 
 ---
 

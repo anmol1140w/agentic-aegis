@@ -350,7 +350,12 @@ def _extract_findings_deterministic(
 
 def _extract_field(text: str, pattern: str, default: Any) -> Any:
     """Extract a field value using a regex pattern, return default if not found."""
-    match = re.search(pattern, text, re.IGNORECASE)
+    if not isinstance(pattern, str) or len(pattern) > 2048:
+        return default
+    try:
+        match = re.search(pattern, str(text)[:256 * 1024], re.IGNORECASE)
+    except re.error:
+        return default
     if match:
         value = match.group(1).strip()[:200]
         # Reject if the captured group starts mid-word (e.g. "SITES" matched as "site")

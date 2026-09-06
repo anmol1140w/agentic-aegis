@@ -23,3 +23,4 @@ def test_create_python_script_is_approved_and_workspace_bound(tmp_path):
     assert result["tool"] == "create_python_script"
     assert (tmp_path / "race_stats.py").read_text() == "print('ok')"
     assert tools.create_python_script("race_stats.txt", "print('ok')")["error"] == "invalid_python_path"
+    assert tools.create_python_script("broken.py", "def broken(:\n pass") ["error"] == "syntax_error"

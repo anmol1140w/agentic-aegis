@@ -76,7 +76,7 @@ class ApprovalManager:
         self.request_approval(task_id, action, details)
         # Rich console formatting is done by the caller (cli.py)
         try:
-            response = input(f"\n⚠  Approve: {action}?\n   {details}\n   [y/N] > ").strip().lower()
+            response = input(f"\n⚠  APPROVAL REQUIRED — AEGIS is waiting for your decision\n   Approve: {action}?\n   {details}\n   Type 'y' to approve or press Enter to deny\n   [y/N] > ").strip().lower()
         except (EOFError, KeyboardInterrupt):
             response = ""
         if response in ("y", "Y", "Yes", "YES", "yes" ):

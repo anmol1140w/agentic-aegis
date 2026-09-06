@@ -6,16 +6,24 @@ import json
 import re
 from typing import Any
 
+from runtime.regex_safety import bounded_text
+
 
 # Allowed read-only workspace tools for Qwen shorthand
 WORKSPACE_READONLY_ACTIONS: set[str] = {
     "list_directory",
+    "tree",
     "read_file",
     "search_files",
     "find_files",
     "get_file_info",
+    "repository_context",
     "git_status",
     "git_diff",
+    "workspace_diff",
+    "list_checkpoints",
+    "list_skills",
+    "read_skill",
 }
 
 # Mutation tools allowed as Qwen shorthand (require approval at execution)
@@ -24,18 +32,25 @@ WORKSPACE_MUTATION_ACTIONS: set[str] = {
     "create_file",
     "create_python_script",
     "execute_command",
+    "create_checkpoint",
+    "restore_checkpoint",
 }
 
 # Tools whose schema permits empty arguments
 TOOLS_PERMITTING_EMPTY_ARGS: set[str] = {
     "list_directory",
+    "tree",
+    "repository_context",
     "git_status",
     "git_diff",
+    "list_checkpoints",
+    "list_skills",
 }
 
 # Required arguments for workspace tools that do not permit empty arguments
 TOOL_REQUIRED_ARGS: dict[str, tuple[str, ...]] = {
     "read_file": ("path",),
+    "tree": (),
     "search_files": ("query",),
     "find_files": ("pattern",),
     "get_file_info": ("path",),
@@ -43,6 +58,10 @@ TOOL_REQUIRED_ARGS: dict[str, tuple[str, ...]] = {
     "create_file": ("path", "content"),
     "create_python_script": ("path", "content"),
     "execute_command": ("command",),
+    "workspace_diff": ("checkpoint_id",),
+    "read_skill": ("name",),
+    "create_checkpoint": (),
+    "restore_checkpoint": ("checkpoint_id",),
 }
 
 
@@ -57,7 +76,7 @@ def parse_action(raw: str) -> dict[str, Any]:
     a JSON decoder is used to locate the first complete object.  No natural
     language command is executed as a fallback.
     """
-    cleaned = re.sub(r"<think>.*?</think>", "", raw or "", flags=re.DOTALL).strip()
+    cleaned = re.sub(r"<think>.*?</think>", "", bounded_text(raw), flags=re.DOTALL).strip()
     if "<think>" in cleaned.lower() and "</think>" not in cleaned.lower():
         json_start = cleaned.find("{")
         cleaned = cleaned[json_start:] if json_start >= 0 else ""

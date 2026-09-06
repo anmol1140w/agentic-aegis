@@ -15,6 +15,24 @@ from tests.test_agent_loop import FakeProvider
 from tools.workspace import WorkspaceReadTools
 
 
+def test_repository_context_is_bounded_and_rooted(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "README.md").write_text("repository contract\n", encoding="utf-8")
+    (root / "src").mkdir()
+    (root / "src" / "main.py").write_text("print('ok')\n", encoding="utf-8")
+    (root / ".venv").mkdir()
+    (root / ".venv" / "secret.txt").write_text("must not enter context\n", encoding="utf-8")
+
+    result = WorkspaceReadTools(root).repository_context()
+
+    assert result["ok"] is True
+    assert result["root"] == str(root.resolve())
+    assert "README.md" in result["important_files"]
+    assert "src/main.py" in result["files"]
+    assert not any("secret.txt" in path for path in result["files"])
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "user_request,expected_tool,provider_script",

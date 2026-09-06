@@ -22,7 +22,7 @@ async def test_qwen_vision_receives_image_and_returns_visible_text() -> None:
         pytest.skip("Set RUN_LIVE_OLLAMA=1 to run the local Ollama acceptance test")
 
     root = Path(__file__).resolve().parents[1]
-    image = root / "images__val__269.jpg"
+    image = root / "tests" / "fixtures" / "pid_fixture.pgm"
     assert image.is_file() and image.stat().st_size > 0
 
     provider = ModelRegistry.from_yaml(root / "config" / "models.yaml").get_provider("qwen-vision")
@@ -32,7 +32,7 @@ async def test_qwen_vision_receives_image_and_returns_visible_text() -> None:
 
     parts = [
         token async for token in provider.stream_chat(
-            [{"role": "user", "content": "Describe this image briefly."}],
+            [{"role": "user", "content": "Describe this simple process-flow/P&ID style diagram briefly. Return only visible observations."}],
             encoded_images=encoded,
             timeout=300.0,
         )

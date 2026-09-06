@@ -1,9 +1,10 @@
 # AEGIS Architecture — Current Status
 
 AEGIS is the local Master-first workbench. The CLI and FastAPI service use the
-same `Orchestrator.run_master` path; the registry selects specialists and the
-policy layer authorizes tools. Legacy classifier/router code remains only for
-compatibility tests and is not the Master execution path.
+same `Orchestrator.run_master` path, which enters one universal LangGraph task
+graph. The registry selects specialists and the policy layer authorizes tools.
+The former classifier/router remains only as a deprecated compatibility surface
+for older library callers and is not invoked by normal CLI/API execution.
 
 ```text
 CLI or FastAPI → NLP → MasterAgent → AgentRegistry → Specialist
@@ -38,13 +39,13 @@ AEGIS — Sovereign Agent Workbench is structured into distinct, modular, and lo
                          │ (orchestrator)  │  Checkpoints (Memory/SQLite)
                          └────────┬────────┘
                                   │
-                   ┌──────────────┴──────────────┐
-                   ▼                             ▼
-        ┌─────────────────────┐       ┌─────────────────────┐
-        │   Task Classifier   │       │     Model Router    │
-        │  & Scoring Engine   │       │   & Model Registry  │
-        └─────────────────────┘       └──────────┬──────────┘
-                                                 │
+                   ┌─────────────────────────────┐
+                   ▼                             │
+        ┌─────────────────────┐                  │
+        │ MasterAgent /       │                  │
+        │ Agent Registry      │──────────────────┘
+        └──────────┬──────────┘
+                   │
                    ┌─────────────────────────────┼─────────────────────────────┐
                    ▼                             ▼                             ▼
           ┌─────────────────┐           ┌─────────────────┐           ┌─────────────────┐
@@ -97,22 +98,19 @@ AEGIS — Sovereign Agent Workbench is structured into distinct, modular, and lo
 
 ---
 
-## 3. LangGraph Orchestrator Flow
+## 3. Universal LangGraph Task Flow
 
 ```text
-[START]
-   │
-   ▼
-[classify] ──▶ Analyzes input text, detects modality, task type, tool requirements
-   │
-   ▼
-[route]    ──▶ Scores candidate models in ModelRegistry, chooses primary or fallback
-   │
-   ▼
-[execute]  ──▶ Binds tools (calculator, files), invokes local model, records traces
-   │
-   ▼
- [END]
+[START] → normalize_request → classify_and_route → create_plan
+   → validate_plan → execute_step → record_step_result → verify_plan
+   ├── verified → review_and_finish
+   └── recoverable failure → structured self_heal → execute_step (bounded)
+   └── unsafe/unrecoverable → safe_failure
+
+Coding tool calls use the same bounded task semantics through the native
+coding subgraph (`reason → validate_action → execute_tool → record_result →
+verify_plan → self_heal`). Document and vision delegation now enter the
+universal graph as well; no specialist is called directly by the CLI.
 ```
 
 State is managed by `AgentState`:
@@ -160,3 +158,23 @@ network policy. File mutation, arbitrary shell, Git mutation, and RAG remain
 explicitly outside the current master capability set. The former classifier
 and router are retained only as library compatibility surfaces and are not
 invoked by the CLI or Master workflow.
+
+The optional `tools.mcp_adapter.AegisMCPAdapter` exposes the same registered
+tools through an MCP-shaped local interface; it delegates to ToolRegistry and
+does not create a second executor or server. A network MCP transport is not
+required for the local deployment. Desktop capture and computer-use actions
+are intentionally disabled pending the dedicated review in
+`docs/computer-use-security-review.md`.
+
+## 5. Evidence-driven task execution
+
+Multi-step coding/workspace runs carry typed task and step contracts from
+`runtime/task_state.py`. Plans are parsed and checked by
+`runtime/plan_parser.py`; unknown tools, malformed parameters, excessive steps,
+and duplicate identifiers are rejected before execution. Every real tool
+result is persisted in graph state, then checked by deterministic verification
+(`runtime/verification.py`). Recoverable failures are classified by
+`runtime/self_healing.py` and may return to the bounded model/tool loop;
+approval denials, path violations, and policy failures are never retried as
+though they were transient errors. Final success requires evidence, not model
+claims.

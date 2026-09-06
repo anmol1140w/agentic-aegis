@@ -11,6 +11,8 @@ import unicodedata
 from dataclasses import asdict, dataclass
 from typing import Any
 
+from runtime.regex_safety import bounded_text
+
 
 @dataclass(frozen=True)
 class Correction:
@@ -56,7 +58,7 @@ class NLPPreprocessor:
 
     def process(self, text: str, *, source: str = "user") -> NLPResult:
         started = time.perf_counter()
-        original = text if isinstance(text, str) else str(text or "")
+        original = bounded_text(text)
         corrections: list[Correction] = []
         value = unicodedata.normalize("NFKC", original)
         value = "".join(ch for ch in value if ch in "\n\t" or not unicodedata.category(ch).startswith("C"))

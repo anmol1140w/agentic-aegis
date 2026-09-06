@@ -24,6 +24,7 @@ from typing import Any
 
 from rich.console import Console
 from rich.panel import Panel
+from rich.rule import Rule
 from rich.table import Table
 from rich.text import Text
 from rich.theme import Theme
@@ -34,10 +35,10 @@ if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 from models.registry import ModelRegistry
-from routing.classifier import Task
 from runtime.orchestrator import Orchestrator
 from security.audit import AuditLogger
 from security.network import NetworkMonitor
+from tools.workspace import WorkspaceReadTools
 
 # ---------------------------------------------------------------------------
 # Rich theme
@@ -63,10 +64,44 @@ console = Console(theme=_THEME)
 def _print_banner() -> None:
     console.set_window_title("AEGIS — Sovereign Agent Workbench")
     banner = Text()
-    banner.append("AEGIS — Sovereign Agent Workbench", style="bold blue")
+    banner.append("AEGIS", style="bold bright_cyan")
+    banner.append("  Sovereign Agent Workbench", style="bold blue")
     banner.append("\n")
-    banner.append("Local • Private • Secure", style="dim")
-    console.print(Panel(banner, border_style="blue", padding=(1, 2)))
+    banner.append("Local inference  •  private workspace  •  policy-controlled tools", style="dim")
+    console.print(Panel(banner, border_style="bright_cyan", padding=(1, 3)))
+
+
+def _print_session_header(session_id: str, availability: dict[str, bool], registry: ModelRegistry) -> None:
+    """Render a compact dashboard before entering the interactive REPL."""
+    table = Table(show_header=True, header_style="bold bright_cyan", box=None, padding=(0, 2))
+    table.add_column("Role", style="dim")
+    table.add_column("Model")
+    table.add_column("State", justify="center")
+    for role in ("qwen-general", "qwen-vision", "qwen-coder", "llama-small"):
+        try:
+            model = registry.get_provider(role).config.model
+        except Exception:
+            model = "configured"
+        available = availability.get(role, False)
+        table.add_row(role, model, "[success]ONLINE[/success]" if available else "[error]OFFLINE[/error]")
+    console.print(Panel(table, title=f"[bold]Session {session_id}[/bold]  [dim]Master-first / LangGraph[/dim]",
+                        subtitle="[dim]Type /help for commands[/dim]", border_style="blue"))
+
+
+def _print_result_summary(result: dict[str, Any]) -> None:
+    status = str(result.get("status", "unknown"))
+    style = "success" if status in {"completed", "success", "verified"} else "warning"
+    table = Table(show_header=False, box=None, padding=(0, 2))
+    table.add_column(style="dim", width=18)
+    table.add_column()
+    table.add_row("Status", f"[{style}]{status.upper()}[/{style}]")
+    table.add_row("Specialist", result.get("selected_agent") or "—")
+    table.add_row("Verification", str(result.get("verification", {}).get("status", "not run")))
+    repairs = result.get("repair_history", [])
+    table.add_row("Repairs", str(len(repairs)))
+    if result.get("output_dir"):
+        table.add_row("Run artifacts", str(result["output_dir"]))
+    console.print(Panel(table, title="[bold bright_cyan]Run Summary[/bold bright_cyan]", border_style="bright_cyan"))
 
 
 def _print_task_info(
@@ -144,6 +179,54 @@ async def _handle_slash_command(raw_input: str, registry: ModelRegistry, network
     if command == "/network":
         _print_network(network)
         return "handled"
+    if command == "/sandbox":
+        # Probe the same project-root sandbox used by the production agent.
+        tools = WorkspaceReadTools(_PROJECT_ROOT, command_approver=lambda *_: True)
+        status = tools.sandbox_status()
+        if not status.get("ready"):
+            console.print(Panel(
+                f"[error]✗ Sandbox unavailable[/error]\n{status.get('message', 'No diagnostic available.')}",
+                title="[bold bright_cyan]AEGIS Sandbox Check[/bold bright_cyan]", border_style="red"))
+            return "handled"
+
+        safe = tools.execute_command('python -c "print(2 + 2)"')
+        blocked = tools.execute_command("curl http://example.com")
+        safe_ok = safe.get("ok") is True and safe.get("exit_code") == 0 and safe.get("stdout", "").strip() == "4"
+        blocked_ok = blocked.get("error") in {"disallowed_command", "capability_denied"}
+        style = "success" if safe_ok and blocked_ok else "warning"
+        table = Table(show_header=False, box=None, padding=(0, 2))
+        table.add_column(style="dim", width=20)
+        table.add_column()
+        table.add_row("Backend", str(status.get("backend", "unknown")))
+        table.add_row("Workspace", str(status.get("workspace", _PROJECT_ROOT / "workspace")))
+        table.add_row("Safe command", f"{'PASS' if safe_ok else 'FAIL'}  exit_code={safe.get('exit_code')}  stdout={safe.get('stdout', '').strip()!r}")
+        table.add_row("Blocked command", f"{'PASS' if blocked_ok else 'FAIL'}  error={blocked.get('error', 'none')}")
+        console.print(Panel(table, title="[bold bright_cyan]AEGIS Sandbox Check[/bold bright_cyan]",
+                            border_style=style))
+        return "handled"
+    if command in {"/help", "/commands"}:
+        console.print(Panel(
+            "[bold]/models[/bold]  show local model health\n"
+            "[bold]/network[/bold] show network/tool counters\n"
+            "[bold]/sandbox[/bold] verify command sandbox and policy\n"
+            "[bold]/status[/bold]  show AEGIS operating principles\n"
+            "[bold]/clear[/bold]   clear the terminal\n"
+            "[bold]/quit[/bold]    exit AEGIS",
+            title="[bold bright_cyan]AEGIS Commands[/bold bright_cyan]", border_style="blue"))
+        return "handled"
+    if command == "/status":
+        console.print(Panel(
+            "[success]LOCAL[/success] inference via Ollama\n"
+            "[success]MASTER[/success] is the only production orchestrator\n"
+            "[success]POLICY[/success] guards paths, commands, approvals, and network\n"
+            "[success]AUDIT[/success] records bounded operational evidence\n"
+            "[dim]Private chain-of-thought is never displayed or persisted.[/dim]",
+            title="[bold bright_cyan]AEGIS Status[/bold bright_cyan]", border_style="blue"))
+        return "handled"
+    if command == "/clear":
+        console.clear()
+        _print_banner()
+        return "handled"
     if command == "/master":
         console.print("[info]Master-agent mode enabled for the next request.[/info]")
         return "master"
@@ -172,11 +255,7 @@ async def _run() -> None:
     console.print("\n[info]Checking model availability…[/info]")
     availability = await registry.check_availability()
     any_available = False
-    for name, available in availability.items():
-        icon = "✓" if available else "✗"
-        style = "success" if available else "error"
-        cfg = registry.get_provider(name).config
-        console.print(f"  [{style}]{icon}[/{style}] {name}  →  {cfg.model}")
+    for available in availability.values():
         if available:
             any_available = True
 
@@ -195,14 +274,13 @@ async def _run() -> None:
         audit=audit,
         network=network,
         availability=availability,
+        workspace_root=_PROJECT_ROOT,
     )
     thread_id = f"session-{uuid.uuid4().hex[:8]}"
     master_mode = False
 
-    console.print(
-        f"\n[info]Session: {thread_id}[/info]"
-        f"\n[info]Commands: /quit /models /network[/info]\n"
-    )
+    _print_session_header(thread_id, availability, registry)
+    console.print(Rule("Ready", style="dim blue"))
 
     while True:
         try:
@@ -223,24 +301,13 @@ async def _run() -> None:
             master_mode = True
             continue
 
-        # Opt-in master entry point. Legacy classifier/router remains the
-        # default path and continues to provide the emergency fallback.
-        if master_mode or user_input.lower().startswith("/master "):
-            master_request = user_input[8:].strip() if user_input.lower().startswith("/master ") else user_input
+        # Every request uses the same Master implementation. `/master` is only
+        # an explicit alias, never a second execution path or fallback.
+        if master_mode:
             master_mode = False
-            try:
-                result = await orchestrator.run_master(master_request)
-                answer = str(result.get("final_answer", ""))
-                console.print(answer or "[warning]Master completed without a final answer.[/warning]")
-                if result.get("errors"):
-                    console.print(f"[warning]Master notes: {result['errors']}[/warning]")
-            except Exception as exc:
-                console.print(f"[error]Master error; legacy path remains available: {exc}[/error]")
-            console.print()
-            continue
+        if user_input.lower().startswith("/master "):
+            user_input = user_input[8:].strip()
 
-        # Master-only default path. Failures are reported as structured Master
-        # results; no alternate router is invoked.
         try:
             def _master_progress(event: dict[str, Any]) -> None:
                 name = str(event.get("event", "")).replace("_", " ").title()
@@ -250,12 +317,74 @@ async def _run() -> None:
                     console.print("  [step]… Master planning[/step]")
                 elif name == "Capability Discovery":
                     console.print("  [step]✓ Capabilities discovered[/step]")
+                elif name == "Plan Created":
+                    console.print("  [step]… Master planning[/step]")
+                elif name == "Plan Validated":
+                    console.print("  [step]✓ Plan validated[/step]")
+                elif name == "Specialist Execution":
+                    console.print(f"  [step]⏳ {event.get('agent', 'specialist')} working…[/step]")
+                elif name == "Model Activity":
+                    # Coding-agent model output is an internal structured
+                    # decision stream, not user-facing text. Keep the actual
+                    # stream for action parsing, but do not flood the CLI with
+                    # token-count progress lines.
+                    if event.get("agent") == "coding_agent":
+                        return
+                    kind = event.get("kind", "inference")
+                    console.print(f"  [dim cyan]⋯ {event.get('agent', 'model')} streaming {kind} ({event.get('token_count', 0)} chars)[/dim cyan]")
+                elif name == "Step Succeeded":
+                    console.print("  [step]✓ Specialist result recorded[/step]")
+                elif name == "Verification Passed":
+                    console.print("  [step]✓ Deterministic verification passed[/step]")
+                elif name == "Verification Failed":
+                    console.print("  [warning]⚠ Deterministic verification failed[/warning]")
+                elif name == "Repair Requested":
+                    console.print("  [warning]↻ Master applying bounded repair[/warning]")
+                elif name == "Repair Rejected":
+                    console.print("  [warning]⚠ No compatible repair available[/warning]")
+                elif name == "Run Failed":
+                    console.print("  [error]✗ Task failed safely[/error]")
+                elif name == "Sandbox Preflight":
+                    console.print("  [dim white]◇ sandbox preflight: checking local execution boundary…[/dim white]")
+                elif name == "Command Started":
+                    console.print(f"  [bright_white]▶ command running inside sandbox[/bright_white]  [dim]{event.get('command', '')}[/dim]")
+                elif name == "Command Finished":
+                    exit_code = event.get("exit_code")
+                    state_style = "dim white" if event.get("status") == "success" and exit_code == 0 else "warning"
+                    console.print(f"  [{state_style}]■ command stopped[/{state_style}]  exit_code={exit_code}  sandbox={event.get('sandbox', {}).get('status', 'unknown') if isinstance(event.get('sandbox'), dict) else 'unknown'}")
+                    stdout = str(event.get("stdout_preview", "")).strip()
+                    stderr = str(event.get("stderr_preview", "")).strip()
+                    if stdout:
+                        console.print(f"    [dim white]stdout › {stdout[:240]}[/dim white]")
+                    if stderr:
+                        console.print(f"    [dim yellow]stderr › {stderr[:240]}[/dim yellow]")
+                elif name == "Command Output":
+                    channel = event.get("stream", "stdout")
+                    style = "dim white" if channel == "stdout" else "dim yellow"
+                    text = str(event.get("text", "")).rstrip()
+                    if text:
+                        console.print(f"    [{style}]{channel} › {text[:240]}[/{style}]")
                 elif name == "Master Delegate":
                     console.print(f"  [step]→ Delegating to {event.get('agent', 'specialist')}[/step]")
                 elif name == "Agent Start":
                     console.print(f"  [step]⏳ {event.get('agent', 'specialist')} working…[/step]")
                 elif name == "Agent Complete":
                     console.print(f"  [step]✓ {event.get('agent', 'specialist')} completed[/step]")
+                elif name == "Tool Requested":
+                    tool_name = event.get("tool", "tool")
+                    args = event.get("arguments", {})
+                    summary = " ".join(f"{key}={value}" for key, value in args.items())
+                    console.print(f"  [tool]→ {tool_name}[/tool]" + (f"  [dim]{summary[:240]}[/dim]" if summary else ""))
+                elif name == "Tool Result":
+                    status = str(event.get("status", "unknown"))
+                    style = "success" if status == "success" else "warning"
+                    detail = f"exit_code={event.get('exit_code')}" if event.get("exit_code") is not None else status
+                    console.print(f"  [{style}]■ {event.get('tool', 'tool')} {detail}[/{style}]")
+                    stderr = str(event.get("stderr_preview", "")).strip()
+                    if stderr:
+                        console.print(f"    [dim yellow]stderr › {stderr[:240]}[/dim yellow]")
+                elif name == "Repair Requested":
+                    console.print(f"  [warning]↻ {event.get('agent', 'agent')} diagnosing failure and replanning[/warning]")
                 elif name == "Master Review":
                     console.print("  [step]✓ Master reviewing result[/step]")
                 elif name == "Master Replan":
@@ -263,8 +392,14 @@ async def _run() -> None:
                 elif name == "Final":
                     console.print("  [step]✓ Final response prepared[/step]")
 
+            console.print()
+            console.print(Panel(f"[bold]Request[/bold]\n{user_input}", border_style="dim", padding=(0, 1)))
             console.print("  [info]⏳ Local model processing…[/info]")
-            master_result = await orchestrator.run_master(user_input, progress_callback=_master_progress)
+            # Do not wrap the run in Rich's live spinner: approval prompts use
+            # stdin and must remain visible/interactive on every terminal.
+            def _live_progress(event: dict[str, Any]) -> None:
+                _master_progress(event)
+            master_result = await orchestrator.run_master(user_input, progress_callback=_live_progress)
             prep = master_result.get("preprocessing", {})
             if prep:
                 meta = prep.get("metadata", {})
@@ -275,139 +410,27 @@ async def _run() -> None:
                     f"{meta.get('processing_duration_ms', 0):.1f}ms"
                 )
             answer = str(master_result.get("final_answer", "Master could not complete the request."))
-            console.print(answer)
+            console.print(Panel(answer, title="[bold bright_cyan]AEGIS Response[/bold bright_cyan]", border_style="green" if not master_result.get("errors") else "yellow"))
             if master_result.get("errors"):
                 console.print(f"[warning]Master errors: {master_result['errors']}[/warning]")
             if master_result.get("output_dir"):
                 console.print(f"[success]✓ output saved:[/success] {master_result['output_dir']}")
+            _print_result_summary(master_result)
             console.print()
+            continue
+        except KeyboardInterrupt:
+            # Ctrl-C cancels the active model/tool request and returns to the
+            # terminal prompt.  It must not print an asyncio traceback or tear
+            # down the whole REPL; this is the CLI equivalent of the reference
+            # runtimes' abort signal.
+            console.print("\n[warning]Request cancelled.[/warning] Returning to the terminal prompt.")
+            continue
+        except asyncio.CancelledError:
+            console.print("\n[warning]Request cancelled.[/warning] Returning to the terminal prompt.")
             continue
         except Exception as exc:
             console.print(f"[error]Master execution failed: {exc}[/error]")
             continue
-
-        # -- Run the agent --
-        task_info: dict[str, Any] | None = None
-        model_name = ""
-        model_id = ""
-        routing_reason = ""
-        is_direct_tool = False
-        response_text = ""
-        printed_length = 0
-        traces: list[dict[str, Any]] = []
-        printed_header = False
-        total_ms: float | None = None
-        import re
-
-        try:
-            async for event in orchestrator.astream(user_input, thread_id):
-                kind = event.get("event", "")
-                name = event.get("name", "")
-                data = event.get("data", {})
-
-                # -- Capture state updates from node outputs --
-                if kind == "on_chain_end" and name in ("classify", "route", "execute_tool", "execute_model"):
-                    output = data.get("output", {})
-                    if isinstance(output, dict):
-                        if "task" in output and output["task"] is not None:
-                            task_info = output["task"]
-                        if "selected_model" in output:
-                            model_name = output["selected_model"]
-                        if "selected_model_id" in output:
-                            model_id = output["selected_model_id"]
-                        if "routing_reason" in output:
-                            routing_reason = output["routing_reason"]
-                        if "is_direct_tool" in output:
-                            is_direct_tool = output["is_direct_tool"]
-                        if "total_ms" in output:
-                            total_ms = output["total_ms"]
-                        if "trace" in output and output["trace"]:
-                            for entry in output["trace"]:
-                                if entry not in traces:
-                                    traces.append(entry)
-
-                        # Print task info after routing completes
-                        if name == "route" and task_info and not printed_header:
-                            _print_task_info(
-                                task_info,
-                                model_name,
-                                model_id,
-                                routing_reason,
-                                is_direct_tool=is_direct_tool,
-                            )
-                            if not is_direct_tool:
-                                console.print(f"[MODEL] {model_name} started")
-                            else:
-                                console.print()
-                            printed_header = True
-
-                        # For direct tool execution (which doesn't stream chat tokens), print result directly
-                        if name == "execute_tool" and "messages" in output:
-                            tool_msg = output["messages"][-1]
-                            tool_content = (
-                                tool_msg.content if hasattr(tool_msg, "content") else str(tool_msg)
-                            )
-                            console.print(tool_content)
-                            response_text = tool_content
-
-                        if name == "execute_model" and output.get("current_step") == "error":
-                            model_content = str(output["messages"][-1].content)
-                            console.print(f"[error]{model_content}[/error]")
-                            response_text = model_content
-
-                        if name in ("execute_tool", "execute_model") and output.get("output_dir"):
-                            console.print(
-                                f"\n[success]✓ output saved:[/success]\n  "
-                                f"{Path(output['output_dir']) / 'result.txt'}"
-                            )
-                            if not is_direct_tool:
-                                console.print(f"[MODEL] completed")
-
-                if kind == "on_agent_status":
-                    if name == "tool":
-                        console.print(f"[TOOL] {data.get('tool', 'unknown')}")
-                    elif name == "tool_result":
-                        console.print(f"[step]✓ tool result received[/step]")
-                    elif name == "thinking" and os.getenv("SHOW_OLLAMA_THINKING", "0") == "1":
-                        # Opt-in, clearly separated, and never persisted as the final answer.
-                        print(f"\r[thinking] {str(data.get('token', ''))[:500]}", end="", flush=True)
-                    elif data.get("message"):
-                        console.print(f"[warning]{data['message']}[/warning]")
-
-                # -- Stream tokens from the LLM (for model tasks) --
-                if kind == "on_chat_model_stream":
-                    chunk = data.get("chunk")
-                    if chunk:
-                        # Stream only the visible model response. Never display provider reasoning fields.
-                        response_token = ""
-                        if hasattr(chunk, "content") and chunk.content:
-                            response_token = chunk.content
-                        elif isinstance(chunk, dict):
-                            response_token = chunk.get("content") or chunk.get("response") or ""
-
-                        if response_token:
-                            response_text += response_token
-                            clean_text = re.sub(r"<think>.*?</think>", "", response_text, flags=re.DOTALL)
-                            clean_text = re.sub(r"<think>.*", "", clean_text, flags=re.DOTALL)
-                            if len(clean_text) > printed_length:
-                                print(clean_text[printed_length:], end="", flush=True)
-                                printed_length = len(clean_text)
-
-            # Newline after streamed response
-            if response_text and not is_direct_tool:
-                print()
-
-            # Show trace & timings
-            if traces:
-                console.print()
-                _print_trace(traces, total_ms=total_ms)
-
-        except KeyboardInterrupt:
-            console.print("\n[warning]Interrupted.[/warning]")
-        except Exception as exc:
-            console.print(f"\n[error]Error: {exc}[/error]")
-
-        console.print()  # spacing between turns
 
     # Cleanup
     _print_network(network)

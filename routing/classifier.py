@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel, Field
+from runtime.regex_safety import bounded_text
 
 
 # ---------------------------------------------------------------------------
@@ -131,6 +132,7 @@ _SOURCE_EXTENSIONS: set[str] = {
 
 _WORKSPACE_PATTERNS: list[str] = [
     r"\b(?:list|show)\b.*\b(?:files?|directory|folder|structure)\b",
+    r"(?<!binary\s)\btree\b|\brecursive(?:ly)?\s+(?:file|directory)|\b(?:directory|file)\s+structure\b",
     r"\bwhat files are here\b",
     r"\bfind\b.*\b(?:files?|python files?)\b",
     r"\bsearch\b.*\b(?:for|in)\b",
@@ -405,7 +407,7 @@ class TaskClassifier:
         previous_task_type: str | None = None,   # NEW
     ) -> Task:
         attached_files = list(attached_files or [])
-        req = user_request.strip()
+        req = bounded_text(user_request).strip()
 
         extracted_paths = extract_file_paths(req)
         for ep in extracted_paths:

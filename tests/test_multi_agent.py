@@ -122,6 +122,30 @@ def test_policy_is_least_privilege_and_approval_gated() -> None:
     assert policy.authorize("edit", "t1", approve=lambda *_: True)
 
 
+def test_repository_analysis_routes_to_coding_workspace_agent() -> None:
+    registry = AgentRegistry()
+    master = MasterAgent(registry)
+    plan = master._capability_plan("Analyze this repository and explain its architecture")
+    assert plan[0]["agent"] == "coding_agent"
+    assert plan[0]["capability"] == "codebase_understanding"
+
+
+def test_terminal_python_command_routes_to_coding_workspace_agent() -> None:
+    registry = AgentRegistry()
+    master = MasterAgent(registry)
+    plan = master._capability_plan('run this python command: python -c "print(2 + 2)"')
+    assert plan[0]["agent"] == "coding_agent"
+    assert plan[0]["capability"] == "terminal_execution"
+
+
+def test_source_path_and_test_repair_route_to_coding_agent() -> None:
+    master = MasterAgent(AgentRegistry())
+    plan = master._capability_plan(
+        "Fix the tests for workspace/agent_test/calculator.py and run pytest"
+    )
+    assert plan[0]["agent"] == "coding_agent"
+
+
 @pytest.mark.asyncio
 async def test_delegate_to_agent_returns_structured_result_and_bounds_depth() -> None:
     registry = AgentRegistry()
@@ -154,6 +178,80 @@ async def test_coding_agent_reads_source_before_analysis() -> None:
 
 
 @pytest.mark.asyncio
+async def test_coding_agent_allows_new_file_creation_without_initial_read(tmp_path) -> None:
+    from unittest.mock import AsyncMock, MagicMock
+
+    calls: list[str] = []
+    source = "def factorial(n):\n    return 1\n"
+    provider = MagicMock()
+    provider.generate = AsyncMock(side_effect=[
+        MagicMock(content='{"action":"tool","tool":"create_file","arguments":{"path":"factorial.py","content":"def factorial(n):\\n    return 1\\n"}}'),
+        MagicMock(content='{"action":"final","answer":"created and verified"}'),
+    ])
+
+    def read_file(path):
+        calls.append("read")
+        return {"ok": True, "content": source, "path": path}
+
+    def create_file(path, content):
+        calls.append("create")
+        (tmp_path / path).write_text(content, encoding="utf-8")
+        return {"ok": True, "path": path}
+
+    agent = OllamaSpecialistAgent(
+        AgentDescriptor(name="coding_agent", role="coding", capabilities=[AgentCapability.CODING],
+                        provider_name="stub", allowed_tools=["read_file", "create_file"]),
+        provider,
+        tools={"read_file": read_file, "create_file": create_file},
+    )
+    result = await agent.run(AgentRequest(
+        task="Create a Python file called factorial.py in the workspace.",
+        context={"workspace_root": str(tmp_path), "path": "factorial.py"},
+    ))
+    assert result.status == AgentStatus.SUCCESS
+    assert calls == ["create", "read"]
+
+
+@pytest.mark.asyncio
+async def test_coding_agent_must_run_requested_file_before_finalizing(tmp_path) -> None:
+    """A premature model final cannot skip the user's explicit run request."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    source = tmp_path / "random_proxy.py"
+    provider = MagicMock()
+    provider.generate = AsyncMock(side_effect=[
+        MagicMock(content='{"action":"create_file","arguments":{"path":"random_proxy.py","content":"print(42)\\n"}}'),
+        # This is the regression: the model tries to summarize after writing.
+        MagicMock(content='{"action":"final","answer":"The random proxy was created."}'),
+        MagicMock(content='{"action":"execute_command","arguments":{"command":"python random_proxy.py"}}'),
+        MagicMock(content='{"action":"final","answer":"Created and ran the file."}'),
+    ])
+
+    def create_file(path, content):
+        source.write_text(content, encoding="utf-8")
+        return {"ok": True, "status": "success", "path": path}
+
+    def read_file(path):
+        return {"ok": True, "status": "success", "path": path, "content": source.read_text(encoding="utf-8")}
+
+    def execute_command(**_):
+        return {"ok": True, "status": "success", "exit_code": 0, "stdout": "42\n", "stderr": ""}
+
+    agent = OllamaSpecialistAgent(
+        AgentDescriptor(name="coding_agent", role="coding", capabilities=[AgentCapability.CODING],
+                        provider_name="stub", allowed_tools=["read_file", "create_file", "execute_command"]),
+        provider,
+        tools={"read_file": read_file, "create_file": create_file, "execute_command": execute_command},
+    )
+    result = await agent.run(AgentRequest(task="create proxy python file and run it and show me the output"))
+
+    assert result.status == AgentStatus.SUCCESS
+    assert result.verification["status"] == "passed"
+    assert result.verification["command"] == "python random_proxy.py"
+    assert provider.generate.await_count == 4
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("approved", [True, False])
 async def test_coding_mutation_reuses_approval_and_verification(approved: bool, tmp_path) -> None:
     from unittest.mock import AsyncMock, MagicMock
@@ -183,6 +281,95 @@ async def test_coding_mutation_reuses_approval_and_verification(approved: bool, 
         assert result.status == AgentStatus.FAILURE
         assert result.approvals[0]["status"] == "denied"
         assert target.read_text() == "return 1\n"
+
+
+@pytest.mark.asyncio
+async def test_coding_agent_diagnoses_failed_command_then_repairs_and_retries(tmp_path):
+    """A failed test is evidence for the same bounded coding loop, not a dead end."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    source = tmp_path / "math_lib.py"
+    source.write_text("def value():\n    return 1\n", encoding="utf-8")
+    provider = MagicMock()
+    provider.generate = AsyncMock(side_effect=[
+        MagicMock(content='{"action":"read_file","arguments":{"path":"math_lib.py"}}'),
+        MagicMock(content='{"action":"execute_command","arguments":{"command":"pytest test_math.py"}}'),
+        MagicMock(content='{"action":"read_file","arguments":{"path":"math_lib.py"}}'),
+        MagicMock(content='{"action":"edit_file","arguments":{"path":"math_lib.py","old_text":"return 1","new_text":"return 2"}}'),
+        MagicMock(content='{"action":"execute_command","arguments":{"command":"pytest test_math.py"}}'),
+        MagicMock(content='{"action":"final","answer":"Fixed and verified after diagnosing the failing test."}'),
+    ])
+    command_results = iter([
+        {"ok": False, "status": "failure", "tool": "execute_command", "exit_code": 1,
+         "stdout": "1 failed", "stderr": "assert 1 == 2"},
+        {"ok": True, "status": "success", "tool": "execute_command", "exit_code": 0,
+         "stdout": "1 passed", "stderr": ""},
+    ])
+
+    def read_file(path):
+        return {"ok": True, "tool": "read_file", "path": path, "content": source.read_text()}
+
+    def edit_file(path, old_text, new_text):
+        text = source.read_text().replace(old_text, new_text, 1)
+        source.write_text(text)
+        return {"ok": True, "status": "success", "tool": "edit_file", "path": path}
+
+    def execute_command(**_):
+        return next(command_results)
+
+    agent = OllamaSpecialistAgent(
+        AgentDescriptor(name="coding_agent", role="coding", capabilities=[AgentCapability.CODING],
+                        provider_name="stub", allowed_tools=["read_file", "edit_file", "execute_command"]),
+        provider, tools={"read_file": read_file, "edit_file": edit_file, "execute_command": execute_command},
+    )
+    result = await agent.run(AgentRequest(task="Fix the failing test in math_lib.py and run pytest test_math.py"))
+
+    assert result.status == AgentStatus.SUCCESS
+    assert "failure:execute_command" in " ".join(result.evidence)
+    assert source.read_text() == "def value():\n    return 2\n"
+    assert provider.generate.await_count == 6
+
+
+@pytest.mark.asyncio
+async def test_duplicate_command_is_rejected_until_state_changes(tmp_path):
+    from unittest.mock import AsyncMock, MagicMock
+
+    source = tmp_path / "math_lib.py"
+    source.write_text("def value():\n    return 1\n", encoding="utf-8")
+    provider = MagicMock()
+    provider.generate = AsyncMock(side_effect=[
+        MagicMock(content='{"action":"read_file","arguments":{"path":"math_lib.py"}}'),
+        MagicMock(content='{"action":"execute_command","arguments":{"command":"pytest test_math.py"}}'),
+        MagicMock(content='{"action":"execute_command","arguments":{"command":"pytest test_math.py"}}'),
+        MagicMock(content='{"action":"edit_file","arguments":{"path":"math_lib.py","old_text":"return 1","new_text":"return 2"}}'),
+        MagicMock(content='{"action":"execute_command","arguments":{"command":"pytest test_math.py"}}'),
+        MagicMock(content='{"action":"final","answer":"Fixed after duplicate command recovery."}'),
+    ])
+    command_results = iter([
+        {"ok": False, "status": "failure", "tool": "execute_command", "exit_code": 1, "stderr": "assertion failed", "stdout": ""},
+        {"ok": True, "status": "success", "tool": "execute_command", "exit_code": 0, "stderr": "", "stdout": "1 passed"},
+    ])
+
+    def read_file(path):
+        return {"ok": True, "status": "success", "path": path, "content": source.read_text()}
+
+    def edit_file(path, old_text, new_text):
+        source.write_text(source.read_text().replace(old_text, new_text, 1))
+        return {"ok": True, "status": "success", "path": path}
+
+    def execute_command(**_):
+        return next(command_results)
+
+    agent = OllamaSpecialistAgent(
+        AgentDescriptor(name="coding_agent", role="coding", capabilities=[AgentCapability.CODING],
+                        provider_name="stub", allowed_tools=["read_file", "edit_file", "execute_command"]),
+        provider, tools={"read_file": read_file, "edit_file": edit_file, "execute_command": execute_command},
+    )
+    result = await agent.run(AgentRequest(task="Fix math_lib.py and run pytest test_math.py"))
+
+    assert result.status == AgentStatus.SUCCESS
+    assert any("duplicate_action:execute_command" in item for item in result.evidence)
+    assert source.read_text().endswith("return 2\n")
 
 
 @pytest.mark.asyncio

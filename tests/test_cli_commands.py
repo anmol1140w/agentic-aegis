@@ -35,6 +35,24 @@ async def test_models_command_never_invokes_agent() -> None:
 
 
 @pytest.mark.asyncio
+async def test_sandbox_command_runs_health_check(monkeypatch: pytest.MonkeyPatch) -> None:
+    class FakeSandboxTools:
+        def __init__(self, _root, **_kwargs):
+            pass
+
+        def sandbox_status(self):
+            return {"ready": True, "backend": "local-process-group", "workspace": "/tmp/workspace"}
+
+        def execute_command(self, command):
+            if command.startswith("python"):
+                return {"ok": True, "exit_code": 0, "stdout": "4\n"}
+            return {"ok": False, "error": "disallowed_command"}
+
+    monkeypatch.setattr(cli, "WorkspaceReadTools", FakeSandboxTools)
+    assert await cli._handle_slash_command("/sandbox", FakeRegistry(), object()) == "handled"
+
+
+@pytest.mark.asyncio
 async def test_quit_command_never_invokes_agent() -> None:
     assert await cli._handle_slash_command("/quit", FakeRegistry(), object()) == "exit"
 

@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import time
 import os
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, AsyncIterator
@@ -27,11 +28,10 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 
 from models.registry import ModelRegistry
-from routing.classifier import ExecutionMode, Task, TaskClassifier
-from routing.router import ModelRouter, RoutingResult
 from runtime.state import AgentState, make_trace_dict
 from runtime.agents import MasterAgent, build_default_agent_registry
-from runtime.actions import ActionParseError, parse_action
+from runtime.coding_graph import run_coding_graph
+from runtime.task_graph import run_task_graph
 from runtime.approvals import ApprovalManager
 from storage.outputs import OutputStore
 from security.audit import AuditLogger
@@ -41,38 +41,15 @@ from tools.files import create_directory, list_files, read_file, write_file
 from tools.ocr import extract_ocr
 from tools.filesystem import FilesystemTools
 from tools.workspace import WorkspaceReadTools
+from tools.documents import DocumentTools
+from tools.vision import VisionRuntime
 from tools.permissions import AccessMode, SessionPermissions
 from tools.registry import ToolRegistry
+from tools.mcp_adapter import AegisMCPAdapter
+from runtime.prompts import SYSTEM_PROMPT, TOOL_LOOP_PROMPT
 
-# System prompt for the workbench agent
-_SYSTEM_PROMPT = """\
-You are an AI assistant in AEGIS — Sovereign Agent Workbench, a secure, \
-fully local, air-gapped environment for sensitive government and \
-industrial work.
-
-Be precise, structured, and professional.
-All processing happens locally. No data leaves this machine.\
-"""
-
-_TOOL_LOOP_PROMPT = """\
-You are operating the local tool loop. Decide exactly one next action and emit
-only one JSON object, with no markdown or explanation outside it.
-Use this schema for a tool call:
-{{"action":"tool","tool":"name","arguments":{{...}}}}
-Use this schema when the task is complete:
-{{"action":"final","answer":"..."}}
-Available tools: {tools}
-Tool results are evidence. Do not invent file contents or claim a tool ran when
-it did not.
-CRITICAL RULES FOR EDITING FILES:
-- Before calling edit_file on any file, you MUST ALWAYS call read_file first to read and analyze the file content.
-- Inspect the returned file text carefully to understand the context and identify the exact lines to modify.
-- In edit_file, the old_text MUST be an exact copy-pasted substring from the read_file result (including whitespace and newlines).
-- Never call edit_file without reading and analyzing the file first.
-For PDF OCR requests, call ocr_pdf first, then explain the returned
-OCR text in the final answer. Keep answers concise and never reveal private
-chain-of-thought.
-"""
+_SYSTEM_PROMPT = SYSTEM_PROMPT
+_TOOL_LOOP_PROMPT = TOOL_LOOP_PROMPT
 
 
 class Orchestrator:
@@ -88,14 +65,21 @@ class Orchestrator:
         output_store: OutputStore | None = None,
         approvals: ApprovalManager | None = None,
         max_iterations: int = 20,
+        workspace_root: str | Path | None = None,
     ):
         self.registry = registry
+        # Deprecated compatibility graph dependencies are loaded lazily.  The
+        # production CLI/API path never constructs or invokes this graph;
+        # run_master enters runtime.task_graph instead.
+        from routing.classifier import TaskClassifier
+        from routing.router import ModelRouter
         self.classifier = TaskClassifier()
         self.router = ModelRouter(registry)
         self.audit = audit or AuditLogger()
         self.network = network or NetworkMonitor()
         self.availability = availability
         self.output_store = output_store or OutputStore()
+        self.workspace_root = Path(workspace_root or self.output_store.workspace_dir).resolve()
         self.approvals = approvals or ApprovalManager()
         self.max_iterations = min(20, max(1, max_iterations))
         self._session_task_type: dict[str, str] = {}   # NEW: thread_id -> last task_type
@@ -105,11 +89,18 @@ class Orchestrator:
             requester=self._request_filesystem_permission,
         )
         self.workspace_tools = WorkspaceReadTools(
-            self.output_store.workspace_dir,
+            self.workspace_root,
             approver=self._edit_approver,
             command_approver=self._command_approver,
         )
+        self.document_tools = DocumentTools(self.output_store.workspace_dir)
+        try:
+            vision_provider = registry.get_provider("qwen-vision")
+        except KeyError:
+            vision_provider = None
+        self.vision_runtime = VisionRuntime(self.output_store.workspace_dir, vision_provider)
         self.tool_registry = self._build_tool_registry()
+        self.mcp_adapter = AegisMCPAdapter(self.tool_registry)
         # Additive capability-driven workflow seam; existing graph remains the
         # backwards-compatible default during migration.
         self.agent_registry = build_default_agent_registry(
@@ -117,9 +108,11 @@ class Orchestrator:
             tools={
                 "read_file": self.workspace_tools.read_file,
                 "list_directory": self.workspace_tools.list_directory,
+                "tree": self.workspace_tools.tree,
                 "search_files": self.workspace_tools.search_files,
                 "find_files": self.workspace_tools.find_files,
                 "get_file_info": self.workspace_tools.get_file_info,
+                "repository_context": self.workspace_tools.repository_context,
                 "git_status": self.workspace_tools.git_status,
                 "git_diff": self.workspace_tools.git_diff,
                 "edit_file": self.workspace_tools.edit_file,
@@ -127,6 +120,13 @@ class Orchestrator:
                 "create_python_script": self.workspace_tools.create_python_script,
                 "execute_command": self.workspace_tools.execute_command,
                 "document_runner": self._run_document_pipeline,
+                "list_documents": self.document_tools.list_documents,
+                "inspect_document_metadata": self.document_tools.inspect_document_metadata,
+                "extract_document_text": self.document_tools.extract_document_text,
+                "search_documents": self.document_tools.search_documents,
+                "read_document_section": self.document_tools.read_document_section,
+                "analyze_image": self.vision_runtime.analyze_image,
+                "compare_images": self.vision_runtime.compare_images,
             },
         )
         try:
@@ -143,22 +143,39 @@ class Orchestrator:
 
     async def run_master(self, user_request: str, *, context: dict[str, Any] | None = None,
                          progress_callback: Any | None = None) -> dict[str, Any]:
-        """Run the bounded capability-driven master workflow.
-
-        This opt-in entry point preserves the established classifier/router
-        graph while exposing structured delegation for incremental migration.
-        """
+        """Run every Master-first request through the universal task graph."""
         request_context = dict(context or {})
-        request_context.setdefault("workspace_root", str(self.output_store.workspace_dir))
+        request_context.setdefault("workspace_root", str(self.workspace_tools.root))
+        # Preserve explicit local media/file references for the universal graph
+        # instead of letting specialist selection discard them.
+        path_match = re.search(r"(?:^|\s)([^\s]+\.(?:pdf|docx?|png|jpe?g|webp|bmp|tiff?|pgm|ppm|py|js|ts|rs|go|java|c|cpp))\b", user_request, re.I)
+        if path_match:
+            candidate = path_match.group(1).strip('`\"\'.,')
+            if candidate.lower().endswith((".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff", ".pgm", ".ppm")):
+                request_context.setdefault("image_paths", [candidate])
+            elif candidate.lower().endswith((".pdf", ".doc", ".docx")):
+                request_context.setdefault("input_path", candidate)
+            else:
+                request_context.setdefault("path", candidate)
         previous_callback = self.master_agent.progress_callback
         self.master_agent.progress_callback = progress_callback
+        previous_command_callback = getattr(self.workspace_tools, "command_event_callback", None)
+        self.workspace_tools.command_event_callback = progress_callback
         try:
-            state = await self.master_agent.run(user_request, context=request_context)
+            graph_state = await run_task_graph(
+                self.master_agent,
+                user_request,
+                workspace_root=str(self.workspace_tools.root),
+                progress_callback=progress_callback,
+                max_task_retries=1,
+                request_context=request_context,
+            )
         finally:
             self.master_agent.progress_callback = previous_callback
-        result = state.model_dump()
+            self.workspace_tools.command_event_callback = previous_command_callback
         run_id = self.output_store.new_run_id()
-        status = "failure" if state.errors and not state.agent_results else "success"
+        result_items = graph_state.get("step_results", [])
+        status = "success" if graph_state.get("status") == "completed" else "failure"
         metadata = {
             "run_id": run_id, "execution_mode": "master", "status": status,
             "task_type": "master", "modality": "text", "model": "qwen3.5:9b",
@@ -166,11 +183,26 @@ class Orchestrator:
             "completed_at": datetime.now(timezone.utc).isoformat(),
         }
         trace = [{"timestamp": datetime.now(timezone.utc).isoformat(), "step": e.get("event", "master"),
-                  "message": e.get("event", "master"), "metadata": e} for e in self.master_agent.trace]
+                  "message": e.get("event", "master"), "metadata": e} for e in graph_state.get("trace", [])]
         trace.append(make_trace_dict("master_persist", "Master result persisted", metadata={"run_id": run_id}))
-        output_dir = self.output_store.save_run(run_id=run_id, result=state.final_answer, metadata=metadata, trace=trace)
-        result.update({"run_id": run_id, "output_dir": str(output_dir), "trace": trace,
-                       "execution_mode": "master"})
+        final_answer = graph_state.get("final_answer", "")
+        output_dir = self.output_store.save_run(run_id=run_id, result=final_answer, metadata=metadata, trace=trace)
+        result = {
+            "run_id": run_id,
+            "output_dir": str(output_dir),
+            "execution_mode": "master",
+            "status": graph_state.get("status", "failed"),
+            "final_answer": final_answer,
+            "preprocessing": graph_state.get("preprocessing", {}),
+            "agent_results": result_items,
+            "master_plan": graph_state.get("plan", []),
+            "verification": graph_state.get("verification", {}),
+            "errors": graph_state.get("errors", []),
+            "repair_history": graph_state.get("repair_history", []),
+            "selected_agent": graph_state.get("selected_agent", ""),
+            "selected_model": graph_state.get("selected_model", ""),
+            "trace": trace,
+        }
         return result
     # -- Tool setup -----------------------------------------------------
 
@@ -188,7 +220,20 @@ class Orchestrator:
                 continue
             reg.register(filesystem_tool, requires_approval=True, tags=["filesystem", "local"])
         for workspace_tool in self.workspace_tools.as_langchain_tools():
-            reg.register(workspace_tool, tags=["workspace", "read_only"])
+            mutation = workspace_tool.name in {
+                "edit_file", "create_file", "create_python_script", "execute_command",
+                "create_checkpoint", "restore_checkpoint",
+            }
+            reg.register(workspace_tool, requires_approval=mutation,
+                        tags=["workspace", "mutation" if mutation else "read_only"],
+                        permissions={"read": not mutation, "write": mutation, "delete": workspace_tool.name == "restore_checkpoint",
+                                     "network": False, "external_side_effect": False,
+                                     "credential_access": False, "system_access": False},
+                        reversible=workspace_tool.name not in {"execute_command"})
+        for document_tool in self.document_tools.as_langchain_tools():
+            reg.register(document_tool, tags=["document", "local", "read_only"])
+        for vision_tool in self.vision_runtime.as_langchain_tools():
+            reg.register(vision_tool, tags=["vision", "local", "read_only"])
         return reg
 
     def _request_filesystem_permission(self, mode: AccessMode, path: Path, reason: str) -> bool:
@@ -271,6 +316,7 @@ class Orchestrator:
     # -- Nodes ----------------------------------------------------------
 
     async def _classify_node(self, state: AgentState) -> dict[str, Any]:
+        from routing.classifier import Task
         t0 = time.perf_counter()
         last_msg = state["messages"][-1]
         user_text = last_msg.content if hasattr(last_msg, "content") else str(last_msg)
@@ -311,6 +357,8 @@ class Orchestrator:
 
     async def _route_node(self, state: AgentState) -> dict[str, Any]:
         """Select the best model or direct tool for the task."""
+        from routing.classifier import Task
+        from routing.router import RoutingResult
         t0 = time.perf_counter()
 
         task_dict = state["task"]
@@ -441,164 +489,55 @@ class Orchestrator:
         encoded_images: list[str] | None = None,
         allowed_tools: set[str] | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
-        """Run bounded model -> tool -> result iterations with JSON actions."""
-        names = [name for name in self.tool_registry.list_names() if allowed_tools is None or name in allowed_tools]
-        tool_names = "\n".join(f"- {name}: {self.tool_registry.get(name).description}" for name in names)
-        loop_messages = [
-            SystemMessage(content=_TOOL_LOOP_PROMPT.format(tools=tool_names)),
-            *messages,
-        ]
-        invalid_actions = 0
-        tool_executed = False
-        for iteration in range(self.max_iterations):
-            self.network.record_model_call()
-            parts: list[str] = []
-            started = time.perf_counter()
-            try:
-                async for token in provider.stream_chat(
-                    self._provider_messages(loop_messages), encoded_images=encoded_images or []
-                ):
-                    parts.append(token)
-            except Exception as exc:
-                yield {"kind": "error", "message": f"Model error: {exc}"}
-                return
-
-            raw = "".join(parts)
-            try:
-                action = parse_action(raw)
-            except ActionParseError as exc:
-                if tool_executed and raw.strip():
-                    yield {
-                        "kind": "final",
-                        "answer": raw.strip(),
-                        "iteration": iteration + 1,
-                        "duration_ms": round((time.perf_counter() - started) * 1000, 2),
-                    }
-                    return
-                invalid_actions += 1
-                loop_messages.extend([
-                    AIMessage(content=raw),
-                    HumanMessage(content=f"Invalid action: {exc}. Emit one valid JSON action."),
-                ])
-                yield {"kind": "status", "message": "Model returned an invalid action; requesting a correction."}
-                if invalid_actions >= 3:
-                    yield {"kind": "error", "message": "The model produced too many invalid tool actions."}
-                    return
-                continue
-
-            if action["action"] == "final":
-                yield {
-                    "kind": "final",
-                    "answer": action["answer"],
-                    "iteration": iteration + 1,
-                    "duration_ms": round((time.perf_counter() - started) * 1000, 2),
-                }
-                return
-
-            name = action["tool"]
-            args = action["arguments"]
-            if name not in names:
-                yield {"kind": "error", "message": f"Tool '{name}' is not allowed for this request."}
-                return
-            yield {"kind": "tool", "tool": name, "arguments": args, "iteration": iteration + 1}
-            tool_started = time.perf_counter()
-            try:
-                self.network.record_tool_call()
-                result = await self.tool_registry.get(name).ainvoke(args)
-                if not isinstance(result, (dict, list, str, int, float, bool, type(None))):
-                    result = str(result)
-                if isinstance(result, dict) and result.get("tool") == "ocr_pdf":
-                    result = {
-                        "ok": result.get("ok"),
-                        "tool": "ocr_pdf",
-                        "source": result.get("source"),
-                        "pages": [
-                            {
-                                "source": page.get("source", {}).get("path"),
-                                "text": page.get("text", ""),
-                                "text_block_count": len(page.get("text_blocks", [])),
-                            }
-                            for page in result.get("pages", [])
-                            if isinstance(page, dict)
-                        ],
-                    }
-                result_text = json.dumps(result, ensure_ascii=False, default=str) if not isinstance(result, str) else result
-                status = "success" if not isinstance(result, dict) or result.get("ok", True) else "failure"
-            except Exception as exc:
-                result_text = json.dumps({"ok": False, "tool": name, "error": type(exc).__name__, "message": str(exc)})
-                status = "failure"
-            try:
-                structured_result = json.loads(result_text)
-            except json.JSONDecodeError:
-                structured_result = None
-            if isinstance(structured_result, dict) and structured_result.get("error") == "UnsupportedFileType":
-                yield {
-                    "kind": "final",
-                    "answer": str(structured_result.get("message", "This file format is not supported.")),
-                    "iteration": iteration + 1,
-                    "duration_ms": round((time.perf_counter() - started) * 1000, 2),
-                }
-                return
-            loop_messages.extend([
-                AIMessage(content=raw),
-                HumanMessage(content=f"TOOL RESULT [{name}]:\n{result_text[:12000]}"),
-            ])
-            tool_executed = True
-            result_size = len(result_text.encode("utf-8"))
-            if name == "edit_file":
-                sanitized_args = {
-                    "path": str(args.get("path", ""))[:200],
-                    "old_text_length": len(str(args.get("old_text", ""))),
-                    "new_text_length": len(str(args.get("new_text", ""))),
-                }
-                approval_state = "approved" if status == "success" else "denied"
-            elif name == "execute_command":
-                sanitized_args = {
-                    "command": str(args.get("command", ""))[:200],
-                    "cwd": str(args.get("cwd", "."))[:100],
-                }
-                if isinstance(structured_result, dict) and structured_result.get("approval") == "approved":
-                    approval_state = "approved"
-                elif isinstance(structured_result, dict) and structured_result.get("error") == "approval_denied":
-                    approval_state = "denied"
-                else:
-                    approval_state = None
-            else:
-                sanitized_args = {key: str(value)[:200] for key, value in args.items()}
-                approval_state = None
-
-            result_event = {
-                "kind": "result", "tool": name, "result": result_text[:12000], "iteration": iteration + 1,
-                "arguments": sanitized_args, "status": status,
-                "duration_ms": round((time.perf_counter() - tool_started) * 1000, 2),
-                "result_size": result_size, "truncated": result_size > 12000,
-            }
-            if approval_state is not None:
-                result_event["approval"] = approval_state
-            yield result_event
-
-            # Post-edit verification: bounded read_file after successful edit
-            if name == "edit_file" and status == "success":
-                edit_path = args.get("path", "")
-                try:
-                    verify_result = self.workspace_tools.read_file(edit_path)
-                    if verify_result.get("ok"):
-                        verify_content = verify_result.get("content", "")
-                        new_text = args.get("new_text", "")
-                        if new_text in verify_content:
-                            verify_msg = f"VERIFICATION [read_file]: edit confirmed — new_text present in {edit_path}"
-                        else:
-                            verify_msg = f"VERIFICATION [read_file]: WARNING — new_text not found in {edit_path} after edit"
-                    else:
-                        verify_msg = f"VERIFICATION [read_file]: failed to read {edit_path} — {verify_result.get('error', 'unknown')}"
-                except Exception as ve:
-                    verify_msg = f"VERIFICATION [read_file]: error reading {edit_path} — {ve}"
-                loop_messages.append(HumanMessage(content=verify_msg))
-                yield {"kind": "result", "tool": "read_file", "result": verify_msg, "iteration": iteration + 1,
-                       "arguments": {"path": edit_path}, "status": "success" if "confirmed" in verify_msg else "failure",
-                       "duration_ms": 0, "result_size": len(verify_msg), "truncated": False, "verification": True}
-
-        yield {"kind": "error", "message": f"Maximum tool-loop iterations ({self.max_iterations}) reached."}
+        """Compatibility event adapter over the native bounded coding graph."""
+        user_task = next(
+            (str(message.content) for message in reversed(messages)
+             if isinstance(message, HumanMessage)),
+            "",
+        )
+        graph_messages = [SystemMessage(content=_TOOL_LOOP_PROMPT.format(
+            tools=", ".join(sorted(allowed_tools or self.tool_registry.list_names())),
+            task=user_task[:4000]
+        )), *messages]
+        try:
+            final_state = await run_coding_graph(
+                provider, self.tool_registry,
+                str(messages[-1].content if messages else ""),
+                allowed_tools=allowed_tools,
+                messages=graph_messages,
+                encoded_images=encoded_images or [],
+                max_iterations=self.max_iterations,
+                on_model_call=self.network.record_model_call,
+                on_tool_call=self.network.record_tool_call,
+            )
+        except Exception as exc:
+            yield {"kind": "error", "message": f"Coding graph error: {exc}"}
+            return
+        for event in final_state.get("events", []):
+            kind = event.get("kind")
+            if kind == "tool_requested":
+                yield {"kind": "tool", "tool": event.get("tool"),
+                       "arguments": event.get("arguments", {}),
+                       "iteration": event.get("iteration", 0)}
+            elif kind == "tool_result":
+                yield {"kind": "result", "tool": event.get("tool"),
+                       "result": event.get("result", ""),
+                       "iteration": event.get("iteration", 0),
+                       "arguments": event.get("arguments", {}),
+                       "status": event.get("status", "failure"),
+                       "duration_ms": event.get("duration_ms", 0),
+                       "result_size": event.get("result_size", 0),
+                       "truncated": event.get("truncated", False),
+                       **({"approval": event["approval"]} if event.get("approval") else {}),
+                       **({"verification": True} if event.get("verification") else {})}
+            elif kind == "safe_error":
+                yield {"kind": "error", "message": final_state.get("final_answer", "Coding graph stopped safely.")}
+        if final_state.get("terminal_status") == "success":
+            yield {"kind": "final", "answer": final_state.get("final_answer", ""),
+                   "iteration": final_state.get("iteration", 0), "duration_ms": 0}
+        elif final_state.get("terminal_status") != "success" and not final_state.get("final_answer"):
+            yield {"kind": "error", "message": "; ".join(final_state.get("errors", [])) or "Coding graph stopped safely."}
+        return
 
     async def run_tool_sequence(self, calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Execute an explicit, ordered local tool plan without bypassing policy.
@@ -770,6 +709,7 @@ class Orchestrator:
         attached_files: list[str] | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
         """Run one request with native provider token streaming for the terminal."""
+        from routing.classifier import ExecutionMode
         initial_state: dict[str, Any] = {
             "messages": [HumanMessage(content=user_input)],
             "attached_files": attached_files or [],
@@ -816,8 +756,7 @@ class Orchestrator:
                 loop_error = ""
                 tool_trace: list[dict[str, Any]] = []
                 loop_started = time.perf_counter()
-                workspace_allowed = {"list_directory", "read_file", "search_files", "find_files", "get_file_info", "git_status", "git_diff", "edit_file"}
-                workspace_allowed = {"list_directory", "read_file", "search_files", "find_files", "get_file_info", "git_status", "git_diff", "edit_file", "execute_command"}
+                workspace_allowed = {"list_directory", "tree", "read_file", "search_files", "find_files", "get_file_info", "repository_context", "git_status", "git_diff", "edit_file", "create_file", "create_python_script", "execute_command"}
                 allowed_tools = workspace_allowed if "workspace_read" in task.get("requires_tools", []) else None
                 async for loop_event in self._stream_tool_loop(provider, messages, encoded_images, allowed_tools):
                     kind = loop_event.get("kind")
@@ -916,6 +855,7 @@ class Orchestrator:
         attached_files: list[str] | None = None,
     ) -> AgentState:
         """Run the graph to completion and return the final state."""
+        from routing.classifier import ExecutionMode
         task = self.classifier.classify(
             user_input,
             attached_files or [],

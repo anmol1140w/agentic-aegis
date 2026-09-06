@@ -62,7 +62,41 @@ All file tools (`read_file`, `write_file`, `list_files`, `create_directory`) mus
 
 ---
 
-## 3. Real Network Auditing (`security/network.py`)
+## 3. Optional Container Command Sandbox
+
+The default `execute_command` backend is the workspace-rooted local process
+sandbox. For broader command inventories, enable the opt-in Docker backend:
+
+```bash
+docker pull python:3.12-slim
+AEGIS_SANDBOX_BACKEND=docker python cli.py
+```
+
+Container commands run with the configured image as container root, which is
+not host root. The container has no network, all Linux capabilities dropped,
+`no-new-privileges`, a read-only root filesystem, bounded memory/CPU/PIDs, and
+only the AEGIS workspace mounted read-write at `/workspace`. Every container
+command requires terminal approval. The host Docker socket and host system
+paths are never mounted, so host `sudo` remains unavailable by design.
+
+Use `/sandbox` in the CLI to check the selected backend. If the image is not
+present locally, AEGIS returns `sandbox_unavailable` rather than falling back
+to host execution.
+
+On Linux, Bubblewrap is the lighter-weight namespace backend:
+
+```bash
+AEGIS_SANDBOX_BACKEND=bwrap python cli.py
+```
+
+It uses user, PID, mount, IPC, UTS, and network namespaces; mounts `/usr`,
+`/bin`, and libraries read-only; mounts only the project workspace at
+`/workspace`; provides a private `/tmp`; and exposes a minimal `/etc` without
+host secrets such as `/etc/shadow`. The process is isolated UID 0 inside the
+user namespace, not privileged host root. Network commands are denied before
+execution unless a future explicitly network-enabled profile is selected.
+
+## 4. Real Network Auditing (`security/network.py`)
 
 Unlike mock indicators, `NetworkMonitor` queries the Linux kernel TCP/UDP connection table using `psutil.net_connections(kind="inet")`:
 

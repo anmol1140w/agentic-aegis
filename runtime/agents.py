@@ -29,7 +29,9 @@ from models.registry import ModelRegistry
 from runtime.approvals import ApprovalManager
 from runtime.actions import ActionParseError, parse_action
 from runtime.errors import ModelTimeoutError
+from runtime.self_healing import classify_failure
 from tools.vision import VisionPreprocessor
+from runtime.prompts import document_prompt, planning_prompt, specialist_prompt
 
 
 class AgentStatus(str, Enum):
@@ -153,10 +155,12 @@ class BaseAgent(ABC):
 
 class OllamaSpecialistAgent(BaseAgent):
     def __init__(self, descriptor: AgentDescriptor, provider: ModelProvider,
-                 tools: dict[str, Callable[..., Any]] | None = None) -> None:
+                 tools: dict[str, Callable[..., Any]] | None = None,
+                 progress_callback: Callable[[dict[str, Any]], None] | None = None) -> None:
         self.descriptor = descriptor
         self.provider = provider
         self.tools = tools or {}
+        self.progress_callback = progress_callback
 
     async def run(self, request: AgentRequest) -> AgentResult:
         execution_id = request.agent_execution_id or f"exec_{uuid.uuid4().hex[:12]}"
@@ -189,13 +193,8 @@ class OllamaSpecialistAgent(BaseAgent):
                 try:
                     generation_source = "local_model"
                     if self.provider is not None:
-                        generation_prompt = (
-                            "Write a concise, factual document in plain text with markdown-like headings. "
-                            f"Topic: {topic}\n"
-                            f"User request and content requirements: {request.task}\n"
-                            f"Specific requirements: {requirements or 'provide a useful overview'}\n"
-                            "Include a title, Introduction, 2-4 informative sections, and Conclusion. "
-                            "Do not include meta-commentary or fabricate citations."
+                        generation_prompt = document_prompt(
+                            topic=topic, task=request.task, requirements=requirements
                         )
                         doc_timeout = max(60.0, float(os.getenv("DOCUMENT_TIMEOUT_SECONDS", "360")))
                         try:
@@ -352,10 +351,25 @@ class OllamaSpecialistAgent(BaseAgent):
         # the explicitly allowlisted read_file tool is used in this phase.
         if AgentCapability.CODING in self.descriptor.capabilities and "read_file" in self.tools:
             candidate = request.context.get("path")
+            creation_intent = bool(re.search(
+                r"\b(create|write|generate|make|new)\b.*\b(?:file|script|program|module)\b",
+                request.task,
+                re.I,
+            ))
             if not candidate and re.search(r"\b(inspect|read|open|review|fix|edit|modify|change)\b", request.task, re.I):
                 match = re.search(r"([\w./-]+\.(?:py|js|ts|rs|go|java|c|cpp|h))", request.task)
                 candidate = match.group(1) if match else None
-            if candidate:
+            candidate_path = Path(str(candidate)) if candidate else None
+            if candidate_path and not candidate_path.is_absolute():
+                workspace_name = Path(str(request.context.get("workspace_root") or Path.cwd())).name
+                if candidate_path.parts and candidate_path.parts[0] == workspace_name:
+                    candidate_path = Path(*candidate_path.parts[1:]) or Path(".")
+                    candidate = str(candidate_path)
+                candidate_path = Path(str(request.context.get("workspace_root") or Path.cwd())) / candidate_path
+            # A requested new file is allowed to skip the read-before-edit
+            # rule. Existing files still require a real read before mutation.
+            new_file_creation = bool(creation_intent and candidate_path and not candidate_path.exists())
+            if candidate and not new_file_creation:
                 try:
                     reader = self.tools["read_file"]
                     source = reader(candidate)
@@ -375,15 +389,142 @@ class OllamaSpecialistAgent(BaseAgent):
                                        summary="Unable to read requested source file", errors=[err_msg])
         read_only_request = bool(re.search(r"\bdo not (?:modify|edit|change)\b", request.task, re.I))
         mutation_request = (not read_only_request) and bool(re.search(r"\b(fix|edit|modify|change|write|create|save|implement|pytest|run tests?)\b", request.task, re.I))
-        if mutation_request and AgentCapability.CODING in self.descriptor.capabilities:
+        command_request = bool(
+            re.search(r"\b(run|execute)\b.*\b(?:command|shell|terminal|python|script|pytest|program)\b", request.task, re.I)
+            or re.search(r"\b(?:python|python3|pytest)\s+(?:-c|-[mM]\s+pytest|[\w./-]+\.py)\b", request.task, re.I)
+        )
+        # A file mutation is not completion when the user also requested an
+        # execution/test step.  Keep this contract in infrastructure rather
+        # than relying on the model to remember to run the command.
+        requires_command = (not read_only_request) and bool(re.search(
+            r"\b(?:run(?: it| the file| tests?)?|execute|pytest|test(?: it|s)?)\b|"
+            r"\bshow me (?:the )?(?:output|result)\b",
+            request.task,
+            re.I,
+        ))
+        repository_request = bool(re.search(r"\b(repository|repo|codebase|source\s+code|architecture)\b", request.task, re.I))
+        if (mutation_request or command_request or repository_request) and AgentCapability.CODING in self.descriptor.capabilities:
             # The model may propose actions, but infrastructure validates and
             # executes only descriptor-allowlisted tools. Approval is delegated
             # to WorkspaceReadTools; this layer never grants it implicitly.
             messages = [{"role": "user", "content": request.task}]
-            saw_read = bool(evidence)
+            saw_read = any(item.startswith("read_file:") for item in evidence)
             invalid_actions = 0
             created_paths: set[str] = set()
             post_create_steps = 0
+            command_executed = False
+            action_state_counts: dict[tuple[str, str, int], int] = {}
+            state_version = 0
+            target_path_hint: str | None = None
+            last_tool_result: dict[str, Any] | None = None
+            # Keep bounded working memory separate from the latest result so a
+            # command failure cannot erase the source files needed to diagnose it.
+            known_files: dict[str, str] = {}
+            prior_state = request.context.get("agent_state", {})
+            if not isinstance(prior_state, dict):
+                prior_state = {}
+            prior_last_tool_result = prior_state.get("last_tool_result")
+            if isinstance(prior_state.get("files_read"), dict):
+                known_files.update({str(k): str(v)[:3500] for k, v in list(prior_state["files_read"].items())[-6:]})
+            if isinstance(prior_state.get("evidence"), list):
+                evidence.extend(str(item)[:500] for item in prior_state["evidence"][-8:])
+            if isinstance(prior_state.get("changes"), list):
+                changes.extend(str(item) for item in prior_state["changes"][-8:])
+            command_executed = bool(prior_state.get("command_executed", False))
+            if isinstance(prior_state.get("verification"), dict):
+                verification = dict(prior_state["verification"])
+            if isinstance(prior_last_tool_result, dict):
+                last_tool_result = dict(prior_last_tool_result)
+            state_version = int(prior_state.get("state_version", 0) or 0)
+            last_edit_state_version = int(prior_state.get("last_edit_state_version", -1) or -1)
+            completed_action_states: set[str] = {
+                str(item) for item in prior_state.get("completed_action_states", [])
+            }
+            command_history: list[dict[str, Any]] = [
+                dict(item) for item in prior_state.get("commands", [])[-12:]
+                if isinstance(item, dict)
+            ]
+
+            def coding_state_snapshot() -> dict[str, Any]:
+                """Return compact state for a graph-level repair invocation."""
+                return {
+                    "files_read": dict(list(known_files.items())[-6:]),
+                    "changes": changes[-8:],
+                    "evidence": evidence[-12:],
+                    "last_tool_result": last_tool_result,
+                    "command_executed": command_executed,
+                    "verification": dict(verification),
+                    "state_version": state_version,
+                    "last_edit_state_version": last_edit_state_version,
+                    "completed_action_states": list(completed_action_states)[-24:],
+                    "commands": command_history[-12:],
+                }
+            if repository_request and "repository_context" in self.tools:
+                try:
+                    if self.progress_callback:
+                        self.progress_callback({"event": "tool_requested", "agent": self.descriptor.name,
+                                                "tool": "repository_context", "arguments": {}, "status": "requested"})
+                    context_result = self.tools["repository_context"]()
+                    if isinstance(context_result, dict) and context_result.get("ok"):
+                        evidence.append(
+                            f"repository_context:{context_result.get('file_count', 0)} files "
+                            f"under {context_result.get('root', '')}"
+                        )
+                        last_tool_result = {
+                            "tool": "repository_context", "status": "success", "ok": True,
+                            "file_count": context_result.get("file_count", 0),
+                            "top_level": [item.get("name") for item in context_result.get("top_level", [])[:40]],
+                            "files": list(context_result.get("files", []))[:160],
+                            "important_files": list(context_result.get("important_files", {}))[:8],
+                            "important_file_previews": {
+                                path: str(content)[:2000]
+                                for path, content in list(context_result.get("important_files", {}).items())[:6]
+                            },
+                            "git_status": context_result.get("git_status", {}).get("output", ""),
+                        }
+                        if self.progress_callback:
+                            self.progress_callback({"event": "tool_result", "agent": self.descriptor.name,
+                                                    "tool": "repository_context", "status": "success",
+                                                    "file_count": context_result.get("file_count", 0)})
+                    else:
+                        evidence.append("repository_context:failed")
+                except Exception as exc:
+                    evidence.append(f"repository_context_error:{type(exc).__name__}")
+            target_match = re.search(r"\b(workspace/[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*)", request.task)
+            if target_match and "list_directory" in self.tools:
+                target_path = target_match.group(1).rstrip(".,:;")
+                target_path_hint = target_path
+                try:
+                    listing = self.tools["list_directory"](target_path)
+                    previews: dict[str, str] = {}
+                    if isinstance(listing, dict) and listing.get("ok") and "read_file" in self.tools:
+                        for item in listing.get("items", [])[:12]:
+                            if not isinstance(item, dict) or item.get("type") != "file":
+                                continue
+                            name = str(item.get("name", ""))
+                            if not name.lower().endswith((".py", ".js", ".ts", ".rs", ".go", ".java", ".md", ".toml", ".json")):
+                                continue
+                            relative = f"{target_path}/{name}"
+                            read_result = self.tools["read_file"](relative)
+                            if isinstance(read_result, dict) and read_result.get("ok"):
+                                content = str(read_result.get("content", ""))
+                                previews[relative] = content[:6000]
+                                known_files[relative] = content[:3500]
+                                evidence.append(f"read_file:{relative} ({len(content)} chars)")
+                                artifacts.append(relative)
+                    last_tool_result = {
+                        **(last_tool_result or {}),
+                        "target_path": target_path,
+                        "target_listing": listing,
+                        "target_previews": previews,
+                    }
+                except Exception as exc:
+                    evidence.append(f"target_context_error:{type(exc).__name__}")
+            # Target preloading is useful for a first attempt, but a repair
+            # must resume from the prior failure rather than replacing it with
+            # the listing result.
+            if isinstance(prior_last_tool_result, dict):
+                last_tool_result = dict(prior_last_tool_result)
             for _ in range(8):
                 if created_paths:
                     post_create_steps += 1
@@ -398,15 +539,39 @@ class OllamaSpecialistAgent(BaseAgent):
                             next_recommendation="Run the approved test command after reviewing the verified file.",
                         )
                 try:
-                    response = await self.provider.generate(
-                        json.dumps({
+                    coding_timeout = max(30.0, float(os.getenv("CODING_STEP_TIMEOUT_SECONDS", "180")))
+                    if not saw_read:
+                        phase_instruction = "The next action MUST be a targeted read_file or list_directory action."
+                    elif requires_command and not command_executed:
+                        phase_instruction = "Source evidence is already available. The next action MUST execute the baseline test or command; do not read files again."
+                    elif command_executed and verification.get("status") == "failed":
+                        phase_instruction = "The last command failed. Diagnose its stderr/stdout and edit the implementation or tests before retrying; do not repeat the same failed command unchanged."
+                    else:
+                        phase_instruction = "Use the existing evidence, make only necessary edits, rerun verification, and then finalize."
+                    coding_prompt = json.dumps({
                             "task": request.task,
                             "evidence": evidence[-4:],
+                            "last_tool_result": last_tool_result,
+                            "working_memory": {
+                                "files_read": dict(list(known_files.items())[-3:]),
+                                "implementation_candidates": [
+                                    path for path in known_files
+                                    if not Path(path).name.startswith("test_")
+                                    and "/tests/" not in path
+                                ][-6:],
+                                "files_modified": changes[-8:],
+                                "commands_and_failures": [
+                                    item for item in evidence
+                                    if item.startswith(("execute_command:", "failure:", "duplicate_action:"))
+                                ][-8:],
+                            },
                             "available_tools": {
                                 "read_file": {"required": ["path"]},
                                 "list_directory": {"required": [], "optional": ["path"]},
+                                "tree": {"required": [], "optional": ["path", "max_depth", "max_entries", "include_hidden", "include_generated"]},
                                 "search_files": {"required": ["query"], "optional": ["path"]},
                                 "find_files": {"required": ["pattern"], "optional": ["path"]},
+                                **({} if repository_request else {"repository_context": {"required": []}}),
                                 "create_file": {"required": ["path", "content"]},
                                 "create_python_script": {"required": ["path", "content"]},
                                 "edit_file": {"required": ["path", "old_text", "new_text"]},
@@ -416,11 +581,76 @@ class OllamaSpecialistAgent(BaseAgent):
                                 "Return exactly one JSON object and no prose. For a workspace operation use "
                                 '{"action":"tool","tool":"<allowed tool>","arguments":{...}}. '
                                 "For a final response use {\"action\":\"final\",\"answer\":\"...\"}. "
-                                "To create the requested program, call create_file before claiming success."
+                                "Repository context has already been loaded by infrastructure; do not repeat "
+                                "repository_context. Start with targeted read_file evidence from the named task "
+                                "directory, then execute the requested test/command before editing. "
+                                f"{phase_instruction} "
+                                "To create the requested program, call create_file before claiming success. "
+                                "If the requested file already exists, read it and continue with the requested "
+                                "execute_command; do not repeat create_file after a file_exists result. "
+                                "When a test fails, preserve the test and repair the implementation unless the "
+                                "failure proves the test is incorrect. Use exact source text from working_memory "
+                                "for old_text; do not invent paths or test files. For a failed test, the next "
+                                "useful action is to inspect or edit one of working_memory.implementation_candidates, "
+                                "not to alter the test merely to make it pass."
                             ),
                         })
-                    )
-                    action = parse_action(response.content)
+                    # JSON is the machine contract, but a short labeled
+                    # evidence block makes failure diagnosis reliable for
+                    # local models that under-attend to deeply nested fields.
+                    if isinstance(last_tool_result, dict) and last_tool_result.get("exit_code") is not None:
+                        source_block = "\n\n".join(
+                            f"FILE {path}:\n{content}" for path, content in list(known_files.items())[-3:]
+                        )
+                        coding_prompt += (
+                            "\n\nFAILURE EVIDENCE (authoritative; do not invent replacements):\n"
+                            f"TOOL: {last_tool_result.get('tool')}\n"
+                            f"EXIT CODE: {last_tool_result.get('exit_code')}\n"
+                            f"STDOUT:\n{last_tool_result.get('stdout', '')}\n"
+                            f"STDERR:\n{last_tool_result.get('stderr', '')}\n"
+                            "INSPECTED SOURCE:\n" + source_block + "\n"
+                            "NEXT STEP: diagnose this failure and edit an implementation file; do not edit a test "
+                            "unless the evidence proves the test is incorrect."
+                        )
+                    stream_method = getattr(type(self.provider), "stream_chat_events", None)
+                    if callable(stream_method):
+                        streamed: list[str] = []
+                        activity_total = 0
+                        last_activity = time.monotonic()
+                        stream_events = self.provider.stream_chat_events(
+                            [{"role": "user", "content": coding_prompt}],
+                            # Ollama's explicit thinking channel is supported
+                            # by qwen3-style models. qwen2.5-coder still gets
+                            # native content streaming without that option.
+                            think=str(getattr(getattr(self.provider, "config", None), "model", "")).lower().startswith("qwen3"),
+                            timeout=coding_timeout,
+                        )
+                        async with asyncio.timeout(coding_timeout):
+                            async for model_event in stream_events:
+                                kind = model_event.get("kind") if isinstance(model_event, dict) else "content"
+                                token = str(model_event.get("token", "")) if isinstance(model_event, dict) else str(model_event)
+                                activity_total += len(token)
+                                if kind == "thinking":
+                                    # Only operational progress is surfaced;
+                                    # private chain-of-thought is never printed.
+                                    if self.progress_callback and (time.monotonic() - last_activity >= 0.35 or len(token) >= 80):
+                                        self.progress_callback({"event": "model_activity", "agent": self.descriptor.name,
+                                                                 "kind": "thinking", "token_count": activity_total})
+                                        last_activity = time.monotonic()
+                                elif kind == "content":
+                                    streamed.append(token)
+                                    if self.progress_callback and (time.monotonic() - last_activity >= 0.35 or len(token) >= 80):
+                                        self.progress_callback({"event": "model_activity", "agent": self.descriptor.name,
+                                                                 "kind": "decision_stream", "token_count": activity_total})
+                                        last_activity = time.monotonic()
+                        if self.progress_callback:
+                            self.progress_callback({"event": "model_activity", "agent": self.descriptor.name,
+                                                     "kind": "decision_complete", "token_count": activity_total})
+                        response_content = "".join(streamed)
+                    else:
+                        response = await asyncio.wait_for(self.provider.generate(coding_prompt), timeout=coding_timeout)
+                        response_content = response.content
+                    action = parse_action(response_content)
                 except ActionParseError as exc:
                     invalid_actions += 1
                     if invalid_actions < 3:
@@ -433,13 +663,15 @@ class OllamaSpecialistAgent(BaseAgent):
                                        summary="Coding action was not valid", evidence=evidence,
                                        artifacts=artifacts, changes=changes, approvals=approvals,
                                        verification=verification,
-                                       errors=[str(exc)[:500], "invalid_action_limit"])
+                                       errors=[str(exc)[:500], "invalid_action_limit"],
+                                       metadata={"coding_state": coding_state_snapshot()})
                 except Exception as exc:
                     err_msg = str(exc)[:500] or type(exc).__name__
                     return AgentResult(agent_execution_id=execution_id, status=AgentStatus.FAILURE,
                                        summary="Coding action was not valid", evidence=evidence,
                                        artifacts=artifacts, changes=changes, approvals=approvals,
-                                       verification=verification, errors=[err_msg])
+                                       verification=verification, errors=[err_msg],
+                                       metadata={"coding_state": coding_state_snapshot()})
                 if action["action"] == "final":
                     if mutation_request and not changes:
                         return AgentResult(agent=self.descriptor.name, agent_execution_id=execution_id,
@@ -453,37 +685,156 @@ class OllamaSpecialistAgent(BaseAgent):
                                            summary="Workspace change was not read back and verified",
                                            evidence=evidence, artifacts=artifacts, changes=changes,
                                            verification=verification, errors=["post_write_verification_required"])
+                    if requires_command and (not command_executed or verification.get("status") != "passed"):
+                        if _ < 7:
+                            evidence.append("execution_required:successful execute_command before final")
+                            if self.progress_callback:
+                                self.progress_callback({"event": "repair_requested", "agent": self.descriptor.name,
+                                                        "tool": "execute_command",
+                                                        "reason": "The task requires a successfully verified command.",
+                                                        "retryable": True})
+                            continue
+                        return AgentResult(agent=self.descriptor.name, agent_execution_id=execution_id,
+                                           status=AgentStatus.FAILURE,
+                                           summary="Requested command was not successfully verified",
+                                           evidence=evidence, artifacts=artifacts, changes=changes,
+                                           approvals=approvals, verification=verification,
+                                           errors=["command_verification_required"])
                     return AgentResult(agent_execution_id=execution_id, status=AgentStatus.SUCCESS,
                                        summary=action["answer"], evidence=evidence, artifacts=artifacts,
-                                       changes=changes, approvals=approvals, verification=verification)
+                                       changes=changes, approvals=approvals, verification=verification,
+                                       metadata={"coding_state": coding_state_snapshot()})
                 name, args = action["tool"], action.get("arguments", {})
+                if name == "execute_command" and target_path_hint and not args.get("cwd"):
+                    args = {**args, "cwd": target_path_hint}
+                    action["arguments"] = args
                 if name not in self.descriptor.allowed_tools or name not in self.tools:
                     return AgentResult(agent_execution_id=execution_id, status=AgentStatus.BLOCKED,
                                        summary="Tool is not permitted for this agent", evidence=evidence,
                                        errors=[f"unauthorized tool: {name}"])
+                action_key = json.dumps({"tool": name, "arguments": args}, sort_keys=True, default=str)
+                state_key = (name, action_key, state_version)
+                state_key_text = json.dumps(state_key, default=str)
+                action_state_counts[state_key] = action_state_counts.get(state_key, 0) + 1
+                if (state_key_text in completed_action_states or action_state_counts[state_key] >= 2) and name in {
+                    "read_file", "list_directory", "tree", "repository_context", "search_files", "find_files", "execute_command"
+                }:
+                    hint = (
+                        f"Duplicate action rejected: {name} with these arguments was already executed in the current "
+                        "repository state. Use the available evidence or choose a different action. A command may be "
+                        "retried after an edit or explicit environment change."
+                    )
+                    evidence.append(f"duplicate_action:{name}:state_{state_version}")
+                    last_tool_result = {"tool": name, "status": "failure", "ok": False,
+                                        "error": "duplicate_action", "retryable": True,
+                                        "message": hint, "available_evidence": evidence[-8:]}
+                    if self.progress_callback:
+                        self.progress_callback({"event": "repair_requested", "agent": self.descriptor.name,
+                                                "tool": name, "reason": hint, "retryable": True,
+                                                "error_type": "duplicate_action"})
+                    continue
+                # A failed verification should normally repair production
+                # code, not weaken the test.  Return actionable feedback for
+                # an accidental test edit while preserving the option to edit
+                # a test when no implementation candidate exists.
+                edit_path = str(args.get("path", ""))
+                implementation_candidates = [
+                    path for path in known_files
+                    if not Path(path).name.startswith("test_") and "/tests/" not in path
+                ]
+                if (name == "edit_file"
+                        and (command_executed or verification.get("status") == "failed")
+                        and (Path(edit_path).name.startswith("test_") or "/tests/" in edit_path)
+                        and implementation_candidates):
+                    hint = (
+                        "The verification failure is evidence about the implementation. "
+                        "Do not edit the test just to make it pass; inspect or edit one of these "
+                        f"implementation files: {implementation_candidates[-6:]}"
+                    )
+                    last_tool_result = {"tool": name, "status": "failure", "ok": False,
+                                        "error": "wrong_repair_target", "retryable": True,
+                                        "message": hint, "available_evidence": evidence[-8:]}
+                    evidence.append("wrong_repair_target:test_file")
+                    if self.progress_callback:
+                        self.progress_callback({"event": "repair_requested", "agent": self.descriptor.name,
+                                                "tool": name, "reason": hint, "retryable": True,
+                                                "error_type": "wrong_repair_target"})
+                    continue
+                if self.progress_callback:
+                    trace_args = {key: (f"<{len(str(value))} chars>" if key in {"old_text", "new_text", "content"} else str(value)[:240]) for key, value in args.items()}
+                    self.progress_callback({"event": "tool_requested", "agent": self.descriptor.name,
+                                            "tool": name, "arguments": trace_args, "status": "requested"})
                 if name == "edit_file" and not saw_read:
                     return AgentResult(agent_execution_id=execution_id, status=AgentStatus.BLOCKED,
                                        summary="read_file is required before edit_file", evidence=evidence,
                                        errors=["edit-before-read blocked"])
                 try:
-                    result = self.tools[name](**args)
+                    if name == "execute_command":
+                        if self.progress_callback:
+                            self.progress_callback({"event": "sandbox_preflight", "agent": self.descriptor.name,
+                                                     "command": str(args.get("command", ""))[:160], "status": "checking"})
+                            self.progress_callback({"event": "command_started", "agent": self.descriptor.name,
+                                                     "command": str(args.get("command", ""))[:160],
+                                                     "cwd": str(args.get("cwd", ".")), "status": "running"})
+                        result = await asyncio.to_thread(self.tools[name], **args)
+                        if self.progress_callback:
+                            self.progress_callback({"event": "command_finished", "agent": self.descriptor.name,
+                                                     "status": result.get("status", "success") if isinstance(result, dict) else "success",
+                                                     "exit_code": result.get("exit_code") if isinstance(result, dict) else None,
+                                                     "sandbox": result.get("sandbox") if isinstance(result, dict) else None,
+                                                     "stdout_preview": str(result.get("stdout", ""))[:240] if isinstance(result, dict) else "",
+                                                     "stderr_preview": str(result.get("stderr", ""))[:240] if isinstance(result, dict) else ""})
+                    else:
+                        result = self.tools[name](**args)
                 except TypeError:
                     result = self.tools[name](args)
                 if not isinstance(result, dict):
                     result = {"ok": True, "result": str(result)}
+                last_tool_result = {
+                    "tool": name,
+                    "status": result.get("status", "success" if result.get("ok", True) else "failure"),
+                    "ok": bool(result.get("ok", True)),
+                    "error": result.get("error"),
+                    "message": str(result.get("message", ""))[:1000],
+                    "exit_code": result.get("exit_code"),
+                    "stdout": str(result.get("stdout", ""))[-5000:],
+                    "stderr": str(result.get("stderr", ""))[-5000:],
+                }
+                if self.progress_callback:
+                    self.progress_callback({"event": "tool_result", "agent": self.descriptor.name,
+                                            "tool": name, "status": last_tool_result["status"],
+                                            "exit_code": result.get("exit_code"),
+                                            "stdout_preview": str(result.get("stdout", ""))[:240],
+                                            "stderr_preview": str(result.get("stderr", ""))[:240]})
                 status = result.get("status", "success" if result.get("ok", True) else "failure")
                 if name == "read_file" and result.get("ok"):
                     saw_read = True
                     path = args.get("path", candidate or "")
                     content = str(result.get("content", ""))
+                    last_tool_result["path"] = str(path)
+                    last_tool_result["content"] = content[:6000]
+                    known_files[str(path)] = content[:3500]
                     evidence.append(f"read_file:{path} ({len(content)} chars)")
                     artifacts.append(str(path))
                     if verification.get("required"):
                         verification["status"] = "verified"
+                elif name == "list_directory" and result.get("ok"):
+                    last_tool_result["path"] = str(args.get("path", "."))
+                    last_tool_result["items"] = result.get("items", [])[:80]
+                elif name == "tree" and result.get("ok"):
+                    last_tool_result["path"] = str(args.get("path", "."))
+                    last_tool_result["tree"] = str(result.get("tree", ""))[:6000]
+                elif name in {"search_files", "find_files"} and result.get("ok"):
+                    last_tool_result["matches"] = result.get("matches", result.get("items", []))[:100]
                 elif name in {"edit_file", "create_file", "create_python_script"}:
                     approvals.append({"tool": name, "status": "approved" if status == "success" else "denied"})
                     if status == "success":
+                        state_version += 1
+                        last_edit_state_version = state_version
                         created_path = str(args.get("path", ""))
+                        # Invalidate the prior snapshot; the mandatory
+                        # readback below will repopulate it with new content.
+                        known_files.pop(created_path, None)
                         changes.append(created_path)
                         if name in {"create_file", "create_python_script"}:
                             created_paths.add(created_path)
@@ -497,6 +848,7 @@ class OllamaSpecialistAgent(BaseAgent):
                                 if isinstance(readback, dict) and readback.get("ok") and str(readback.get("content", "")).strip():
                                     saw_read = True
                                     verification["status"] = "verified"
+                                    known_files[created_path] = str(readback.get("content", ""))[:3500]
                                     evidence.append(f"post_create_readback:{created_path}")
                                 else:
                                     verification["status"] = "failed"
@@ -535,24 +887,45 @@ class OllamaSpecialistAgent(BaseAgent):
                                            changes=changes, approvals=approvals, verification=verification,
                                            errors=["post-edit verification required"])
                     approvals.append({"tool": name, "status": "approved" if result.get("approval") == "approved" or status == "success" else "denied"})
+                    command_executed = True
                     verification = {"required": True, "command": str(args.get("command", "")),
                                     "status": "passed" if status == "success" and result.get("exit_code", 0) == 0 else "failed"}
+                    command_history.append({
+                        "command": str(args.get("command", "")),
+                        "cwd": str(args.get("cwd", ".")),
+                        "exit_code": result.get("exit_code"),
+                        "stdout": str(result.get("stdout", ""))[-4000:],
+                        "stderr": str(result.get("stderr", ""))[-4000:],
+                        "timed_out": bool(result.get("timed_out", False)),
+                        "state_version": state_version,
+                    })
                 evidence.append(f"{name}:{status}")
+                completed_action_states.add(state_key_text)
                 if status != "success":
+                    failure = classify_failure(result)
+                    detail = str(result.get("error") or result.get("message") or "tool failed")[:500]
+                    evidence.append(f"failure:{name}:{detail}")
+                    if failure["retryable"] and _ < 7:
+                        if self.progress_callback:
+                            self.progress_callback({"event": "repair_requested", "agent": self.descriptor.name,
+                                                    "tool": name, "reason": detail, "retryable": True})
+                        continue
                     return AgentResult(agent_execution_id=execution_id, status=AgentStatus.FAILURE,
                                        summary=f"{name} failed", evidence=evidence, artifacts=artifacts,
                                        changes=changes, approvals=approvals, verification=verification,
-                                       errors=[str(result.get("error", result.get("message", "tool failed")))])
+                                       errors=[detail], metadata={"coding_state": coding_state_snapshot()})
             return AgentResult(agent_execution_id=execution_id, status=AgentStatus.BLOCKED,
                                summary="Coding tool loop limit reached", evidence=evidence,
                                artifacts=artifacts, changes=changes, approvals=approvals,
-                               verification=verification, errors=["max tool steps reached"])
-        prompt = (
-            f"Role: {self.descriptor.role}\nTask: {request.task}\n"
-            f"Context: {json.dumps(request.context, default=str)[:8000]}\n"
-            f"Constraints: {request.constraints}\n"
-            f"Evidence references: {evidence}\nExpected output: {request.expected_output}\n"
-            "Return a JSON object matching AgentResult."
+                               verification=verification, errors=["max tool steps reached"],
+                               metadata={"coding_state": coding_state_snapshot()})
+        prompt = specialist_prompt(
+            role=self.descriptor.role,
+            task=request.task,
+            context=request.context,
+            constraints=request.constraints,
+            evidence=evidence,
+            expected_output="a JSON object matching AgentResult",
         )
         try:
             response = await self.provider.generate(prompt)
@@ -645,9 +1018,9 @@ def build_default_agent_registry(model_registry: ModelRegistry,
     """Create the initial specialists from configuration, not master logic."""
     definitions = [
         ("coding_agent", "coding specialist", "qwen-coder", [AgentCapability.CODING],
-         ["list_directory", "read_file", "search_files", "find_files", "get_file_info", "git_status", "git_diff", "edit_file", "create_file", "create_python_script", "execute_command"]),
-        ("vision_agent", "vision and diagram specialist", "qwen-vision", [AgentCapability.VISION], []),
-        ("document_agent", "document analysis and creation specialist", "qwen-general", [AgentCapability.DOCUMENT], ["document_runner", "ocr_pdf", "create_document"]),
+         ["list_directory", "tree", "read_file", "search_files", "find_files", "get_file_info", "repository_context", "git_status", "git_diff", "list_skills", "read_skill", "workspace_diff", "list_checkpoints", "edit_file", "create_file", "create_python_script", "execute_command", "create_checkpoint", "restore_checkpoint"]),
+        ("vision_agent", "vision and diagram specialist", "qwen-vision", [AgentCapability.VISION], ["analyze_image", "compare_images"]),
+        ("document_agent", "document analysis and creation specialist", "qwen-general", [AgentCapability.DOCUMENT], ["document_runner", "ocr_pdf", "create_document", "list_documents", "inspect_document_metadata", "extract_document_text", "search_documents", "read_document_section"]),
         ("lightweight_agent", "lightweight formatting specialist", "llama-small", [AgentCapability.LIGHTWEIGHT], []),
         ("general_agent", "general reasoning specialist", "qwen-general", [AgentCapability.GENERAL], []),
     ]
@@ -724,7 +1097,39 @@ class MasterAgent:
         output_match = re.search(r"\b(docx|word document|microsoft word|pdf|markdown|md|txt)\b", text)
         output = output_match.group(1) if output_match else None
         modality = "image" if re.search(r"\b(image|p&id|diagram|visual)\b", text) else "document" if re.search(r"\b(pdf|document|report|ocr|markdown|md|txt)\b", text) else None
-        code_intent = bool(re.search(r"\b(write|generate|create|implement|debug|fix)\b.*\b(code|python|function|script)\b", text))
+        code_intent = bool(re.search(
+            r"\b(source\s+code|code|coding|python|test|tests|pytest|compile|compilation|debug|debugging|"
+            r"fix|repair|implement|implementation|function|module|script)\b|"
+            r"\.(py|js|ts|rs|go|java|c|cpp|h)\b",
+            text,
+        ))
+        command_intent = bool(
+            re.search(r"\b(run|execute)\b.*\b(?:command|shell|terminal|python|script|pytest|program)\b", text)
+            or re.search(r"\b(?:python|python3|pytest)\s+(?:-c|-[mM]\s+pytest|[\w./-]+\.py)\b", text)
+        )
+        repository_intent = bool(re.search(
+            r"\b(repository|repo|codebase|source\s+code|software\s+architecture|architecture\s+of\s+this)\b",
+            text,
+        ))
+        # Repository understanding is a coding/workspace capability even when
+        # the user asks for analysis only. Keep this deterministic precedence
+        # ahead of fuzzy matching, which can mistake "architecture" for a
+        # visual/diagram task.
+        if repository_intent:
+            return [{"agent": "coding_agent", "task": request,
+                     "capability": "codebase_understanding",
+                     "success_criteria": ["repository evidence and architecture explanation"]}]
+        if command_intent:
+            return [{"agent": "coding_agent", "task": request,
+                     "capability": "terminal_execution",
+                     "success_criteria": ["command result with exit code and output"]}]
+        # Source/test intent is deterministic and must win over semantic
+        # document scores (for example, a .py path in a sentence containing
+        # "report" or "documentation").
+        if code_intent:
+            return [{"agent": "coding_agent", "task": request,
+                     "capability": "code_debugging",
+                     "success_criteria": ["source evidence and appropriate execution evidence"]}]
         if code_intent:
             modality, output = "text", None
         ranked, _ = self.capability_matcher.rank(request, modality=modality, output=output, top_k=3)
@@ -776,6 +1181,8 @@ class MasterAgent:
                                expected_output=expected_output, success_criteria=success_criteria or [],
                                trace_id=trace_id or uuid.uuid4().hex, depth=depth,
                                agent_execution_id=execution_id)
+        if hasattr(specialist, "progress_callback"):
+            specialist.progress_callback = self.progress_callback
         result = await specialist.run(request)
         result.agent_execution_id = execution_id
         return result
@@ -820,10 +1227,9 @@ class MasterAgent:
                 self._event("MASTER_PLAN_WARNING", state, reason=str(exc)[:300])
         elif self.master_provider is not None:
             try:
-                prompt = ("Understand the user's objective first, then plan it. Return one JSON object with "
-                          "task_spec {operation, topic, content_requirements, artifact_format, modality} and "
-                          "plan (a list of {agent, task, success_criteria}); never mention model IDs.\n"
-                          f"Capabilities: {json.dumps(self.registry.capabilities())}\nRequest: {planning_request[:4000]}")
+                prompt = planning_prompt(
+                    capabilities=self.registry.capabilities(), request=planning_request
+                )
                 response = await asyncio.wait_for(self.master_provider.generate(prompt), self.total_timeout_seconds)
                 parsed = json.loads(response.content)
                 if isinstance(parsed, dict):

@@ -243,14 +243,17 @@ def _encode_image(path: str | Path) -> str:
     try:
         with Image.open(io.BytesIO(data)) as source:
             source.load()
-            if max(source.size) <= _VISION_MAX_SIDE:
+            if max(source.size) <= _VISION_MAX_SIDE and image.suffix.lower() not in {".pgm", ".ppm", ".pbm"}:
                 encoded = data
             else:
                 source.thumbnail((_VISION_MAX_SIDE, _VISION_MAX_SIDE))
                 if source.mode not in ("RGB", "L"):
                     source = source.convert("RGB")
                 buffer = io.BytesIO()
-                source.save(buffer, format="JPEG", quality=90, optimize=True)
+                if image.suffix.lower() in {".pgm", ".ppm", ".pbm"}:
+                    source.save(buffer, format="PNG", optimize=True)
+                else:
+                    source.save(buffer, format="JPEG", quality=90, optimize=True)
                 encoded = buffer.getvalue()
     except (UnidentifiedImageError, OSError, ValueError) as exc:
         raise InvalidImageError(f"Invalid or unsupported image: {image}") from exc
@@ -262,5 +265,7 @@ def _looks_like_image(data: bytes, suffix: str) -> bool:
     if data.startswith(signatures):
         return True
     if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return True
+    if suffix.lower() in {".pgm", ".ppm", ".pbm"} and data[:2] in {b"P2", b"P3", b"P4", b"P5", b"P6"}:
         return True
     return suffix.lower() == ".svg" and b"<svg" in data[:1024].lower()
