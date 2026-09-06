@@ -1,0 +1,115 @@
+# =============================================================================
+# Python Bytecode and Cache
+# =============================================================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# =============================================================================
+# Virtual Environments
+# =============================================================================
+.venv/
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# =============================================================================
+# Packaging, Distribution, and Build Artifacts
+# =============================================================================
+build/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+*.egg
+MANIFEST
+wheelhouse/
+
+# =============================================================================
+# Testing, Coverage, and Linting
+# =============================================================================
+.pytest_cache/
+.coverage
+.coverage.*
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+htmlcov/
+.tox/
+.nox/
+.hypothesis/
+.mypy_cache/
+.pyre/
+.pytype/
+.ruff_cache/
+
+# =============================================================================
+# Application Logs and Audit Data
+# =============================================================================
+logs/*.log
+logs/*.jsonl
+*.log
+!logs/.gitkeep
+
+# =============================================================================
+# Database and Storage Files
+# =============================================================================
+data/*.db
+data/*.sqlite*
+*.db
+*.sqlite3
+!data/.gitkeep
+# =============================================================================
+# Workspace
+# =============================================================================
+
+# Ignore everything in workspace
+workspace/**
+
+# Allow directories so Git can see README files
+!workspace/**/
+
+# Allow README.md files
+!workspace/**/README.md
+
+# Generated test artifacts and page extractions
+test_image.jpg
+*_pages/
+
+# =============================================================================
+# Secrets, Keys, and Environment Variables
+# =============================================================================
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+
+# =============================================================================
+# IDE, Editor, and OS Artifacts
+# =============================================================================
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+

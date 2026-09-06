@@ -1,0 +1,47 @@
+# Model registry — maps logical model names to Ollama model identifiers.
+# Edit model names to match your local Ollama installation (`ollama list`).
+
+models:
+
+  qwen-general:
+    provider: ollama
+    model: "qwen3.5:9b"
+    capabilities:
+      - general
+      - reasoning
+      - summarization
+      - document_analysis
+      - artifact_generation
+    context_length: 32768
+    priority: 10
+
+  qwen-vision:
+    provider: ollama
+    model: "qwen3-vl:8b"
+    capabilities:
+      - vision
+      - multimodal
+      - image_analysis
+      - document_analysis
+    context_length: 32768
+    priority: 10
+
+  qwen-coder:
+    provider: ollama
+    model: "qwen2.5-coder:7b"
+    capabilities:
+      - coding
+      - debugging
+      - calculation
+    context_length: 32768
+    priority: 10
+
+  llama-small:
+    provider: ollama
+    model: "llama3.2:1b"
+    capabilities:
+      - general
+      - lightweight
+    context_length: 8192
+    priority: 1
+    is_fallback: true

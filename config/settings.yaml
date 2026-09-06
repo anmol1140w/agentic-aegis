@@ -1,0 +1,31 @@
+# SIH Sovereign AI Workbench — Application Settings
+
+ollama:
+  base_url: "http://localhost:11434"
+  request_timeout: 120          # seconds
+  health_check_timeout: 5       # seconds
+
+workspace:
+  base_dir: "./workspace"       # Controlled directory for file operations
+  artifacts_dir: "./workspace/artifacts"
+  uploads_dir: "./workspace/uploads"
+
+security:
+  allowed_paths:
+    - "./workspace"
+  blocked_patterns:
+    - "../../"
+    - "/etc/"
+    - "/root/"
+    - "/proc/"
+    - "/sys/"
+  max_file_size_mb: 50
+  audit_log_path: "./logs/audit.jsonl"
+
+agent:
+  max_iterations: 20            # LangGraph recursion limit
+  default_temperature: 0.7
+  stream_output: true
+
+storage:
+  database_path: "./data/workbench.db"

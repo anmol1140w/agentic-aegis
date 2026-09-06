@@ -1,0 +1,24 @@
+{
+  "version": 1,
+  "offline_default": true,
+  "tools": [
+    {"name":"read_file","category":"filesystem","status":"implemented","risk":"low","read":true,"write":false,"delete":false,"network":false,"approval_required":false,"offline_capable":true},
+    {"name":"list_files","category":"filesystem","status":"implemented","risk":"low","read":true,"write":false,"delete":false,"network":false,"approval_required":false,"offline_capable":true},
+    {"name":"search_files","category":"filesystem","status":"implemented","risk":"low","read":true,"write":false,"delete":false,"network":false,"approval_required":false,"offline_capable":true},
+    {"name":"find_files","category":"filesystem","status":"implemented","risk":"low","read":true,"write":false,"delete":false,"network":false,"approval_required":false,"offline_capable":true},
+    {"name":"edit_file","category":"code","status":"implemented","risk":"high","read":true,"write":true,"delete":false,"network":false,"approval_required":true,"offline_capable":true},
+    {"name":"create_file","category":"code","status":"implemented","risk":"high","read":true,"write":true,"delete":false,"network":false,"approval_required":true,"offline_capable":true},
+    {"name":"execute_command","category":"process","status":"implemented","risk":"high","read":true,"write":true,"delete":false,"network":false,"approval_required":true,"offline_capable":true},
+    {"name":"git_status","category":"git","status":"implemented","risk":"low","read":true,"write":false,"delete":false,"network":false,"approval_required":false,"offline_capable":true},
+    {"name":"git_diff","category":"git","status":"implemented","risk":"low","read":true,"write":false,"delete":false,"network":false,"approval_required":false,"offline_capable":true},
+    {"name":"ocr_pdf","category":"ocr","status":"implemented","risk":"low","read":true,"write":true,"delete":false,"network":false,"approval_required":false,"offline_capable":true},
+    {"name":"document_runner","category":"document","status":"implemented","risk":"medium","read":true,"write":true,"delete":false,"network":false,"approval_required":false,"offline_capable":true},
+    {"name":"create_document","category":"document","status":"implemented","risk":"medium","read":true,"write":true,"delete":false,"network":false,"approval_required":false,"offline_capable":true},
+    {"name":"calculator","category":"math","status":"implemented","risk":"low","read":false,"write":false,"delete":false,"network":false,"approval_required":false,"offline_capable":true},
+    {"name":"validate_artifact","category":"validation","status":"planned","risk":"low","read":true,"write":false,"delete":false,"network":false,"approval_required":false,"offline_capable":true},
+    {"name":"query_database","category":"database","status":"planned","risk":"medium","read":true,"write":false,"delete":false,"network":false,"approval_required":false,"offline_capable":true},
+    {"name":"web_search","category":"web","status":"disabled","risk":"high","read":true,"write":false,"delete":false,"network":true,"approval_required":true,"offline_capable":false},
+    {"name":"git_commit","category":"git","status":"disabled","risk":"critical","read":false,"write":true,"delete":false,"network":false,"approval_required":true,"offline_capable":true},
+    {"name":"delete_file","category":"filesystem","status":"disabled","risk":"critical","read":false,"write":true,"delete":true,"network":false,"approval_required":true,"offline_capable":true}
+  ]
+}
