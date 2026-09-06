@@ -28,7 +28,7 @@ class ToolMeta(BaseModel):
     description: str
     risk_level: RiskLevel = RiskLevel.LOW
     requires_approval: bool = False
-    timeout_seconds: int = 30
+    timeout_seconds: int = 90
     tags: list[str] = Field(default_factory=list)
     category: str = "general"
     status: str = "implemented"
@@ -59,7 +59,7 @@ class ToolRegistry:
         *,
         risk_level: RiskLevel = RiskLevel.LOW,
         requires_approval: bool = False,
-        timeout_seconds: int = 30,
+        timeout_seconds: int = 90,
         tags: list[str] | None = None,
         category: str = "general",
         permissions: dict[str, bool] | None = None,

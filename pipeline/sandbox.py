@@ -56,7 +56,7 @@ def run_sandboxed(
     *,
     script_path: Path | str,
     input_data: str | None = None,
-    timeout_seconds: int = 30,
+    timeout_seconds: int = 90,
     python_executable: str | None = None,
 ) -> SandboxResult:
     """Execute a Python script in a bounded sandbox.

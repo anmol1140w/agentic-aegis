@@ -165,7 +165,7 @@ class FilesystemTools:
                 check=True,
                 capture_output=True,
                 text=True,
-                timeout=120,
+                timeout=180,
             )
             pages = sorted(destination.glob("page-*.png"))
             if not pages:

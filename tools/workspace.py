@@ -83,7 +83,7 @@ class WorkspaceReadTools:
 
     def _git(self, *args: str) -> dict[str, Any]:
         try:
-            result = subprocess.run(["git", *args], cwd=self.root, capture_output=True, text=True, timeout=10, check=False)
+            result = subprocess.run(["git", *args], cwd=self.root, capture_output=True, text=True, timeout=70, check=False)
         except OSError as exc:
             return {"ok": False, "error": "GitUnavailable", "message": str(exc)}
         return {"ok": result.returncode == 0, "tool": f"git_{args[0]}", "output": (result.stdout or result.stderr)[:_MAX_FILE_BYTES]}
@@ -345,7 +345,7 @@ class WorkspaceReadTools:
         self,
         command: str,
         cwd: str = ".",
-        timeout: int = 30,
+        timeout: int = 90,
         approver: Any = None,
     ) -> dict[str, Any]:
         """Execute a controlled command inside the workspace root under strict policy."""
@@ -418,7 +418,7 @@ class WorkspaceReadTools:
                 }
 
         # Setup restricted environment
-        safe_timeout = max(1, min(60, int(timeout)))
+        safe_timeout = max(1, min(120, int(timeout)))
         env = {
             "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
             "HOME": str(self.root),
@@ -612,7 +612,7 @@ class WorkspaceReadTools:
             """Create an approved Python script in the workspace; does not execute it."""
             return self.create_python_script(path, content)
         @tool
-        def execute_command(command: str, cwd: str = ".", timeout: int = 30) -> dict[str, Any]:
+        def execute_command(command: str, cwd: str = ".", timeout: int = 90) -> dict[str, Any]:
             """Execute an allowed command (e.g. pytest) inside workspace root."""
             return self.execute_command(command, cwd=cwd, timeout=timeout)
 

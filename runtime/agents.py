@@ -28,6 +28,7 @@ from models.base import ModelProvider
 from models.registry import ModelRegistry
 from runtime.approvals import ApprovalManager
 from runtime.actions import ActionParseError, parse_action
+from runtime.errors import ModelTimeoutError
 from tools.vision import VisionPreprocessor
 
 
@@ -196,8 +197,28 @@ class OllamaSpecialistAgent(BaseAgent):
                             "Include a title, Introduction, 2-4 informative sections, and Conclusion. "
                             "Do not include meta-commentary or fabricate citations."
                         )
-                        response = await asyncio.wait_for(self.provider.generate(generation_prompt), 90.0)
-                        content = str(response.content or "").strip()
+                        doc_timeout = max(60.0, float(os.getenv("DOCUMENT_TIMEOUT_SECONDS", "360")))
+                        try:
+                            raw_ctx = getattr(getattr(self.provider, "config", None), "context_length", None)
+                            ctx_limit = min(raw_ctx, 4096) if isinstance(raw_ctx, int) else 4096
+                            response = await asyncio.wait_for(
+                                self.provider.generate(
+                                    generation_prompt,
+                                    timeout=doc_timeout,
+                                    num_ctx=ctx_limit,
+                                    num_predict=1000,
+                                ),
+                                doc_timeout,
+                            )
+                            content = str(response.content or "").strip()
+                        except (asyncio.TimeoutError, ModelTimeoutError) as timeout_exc:
+                            generation_source = "bounded_template_timeout_fallback"
+                            content = (f"{topic}\n\n# Introduction\n\n"
+                                       f"This document provides a concise overview of {topic}. {requirements}\n\n"
+                                       f"# Background\n\nThe subject of {topic} is presented here in a structured, accessible format.\n\n"
+                                       f"# Key points\n\nThis section summarizes important context and notable aspects of {topic}.\n\n"
+                                       f"# Conclusion\n\nIn summary, {topic} remains a significant subject for further study.")
+                            evidence.append(f"local_model_timeout_fallback:{type(timeout_exc).__name__}")
                     else:
                         generation_source = "bounded_template_no_provider"
                         content = (f"{topic}\n\n# Introduction\n\n"
@@ -214,9 +235,10 @@ class OllamaSpecialistAgent(BaseAgent):
                         from pipeline.document_artifacts import create_document_artifact
                         create_document_artifact(content, normalized_format, artifact)
                 except Exception as exc:
+                    err_msg = str(exc)[:300] or type(exc).__name__
                     return AgentResult(agent=self.descriptor.name, agent_execution_id=execution_id,
                                        status=AgentStatus.FAILURE, summary="Document creation failed",
-                                       errors=[str(exc)[:300]], metadata={"operation": "create_document"})
+                                       errors=[err_msg], metadata={"operation": "create_document"})
                 content_length = len(content.strip())
                 if normalized_format == "docx":
                     valid = artifact.exists() and artifact.stat().st_size > 0 and zipfile.is_zipfile(artifact)
@@ -253,9 +275,10 @@ class OllamaSpecialistAgent(BaseAgent):
                                                                          "content_length": content_length,
                                                                          "content_requirements": requirements})
             except Exception as exc:
+                err_msg = str(exc)[:300] or type(exc).__name__
                 return AgentResult(agent=self.descriptor.name, agent_execution_id=execution_id,
                                    status=AgentStatus.FAILURE, summary="Document creation failed",
-                                   errors=[str(exc)[:300]], metadata={"operation": "create_document"})
+                                   errors=[err_msg], metadata={"operation": "create_document"})
         # Document processing stays in the established deterministic pipeline;
         # the specialist only adapts its structured output for Master review.
         if AgentCapability.DOCUMENT in self.descriptor.capabilities and "document_runner" in self.tools:
@@ -284,9 +307,10 @@ class OllamaSpecialistAgent(BaseAgent):
                                    errors=[] if ok else [str(output.get("error", "document failure"))],
                                    metadata={"input_path": Path(str(source_path)).name})
             except Exception as exc:
+                err_msg = str(exc)[:500] or type(exc).__name__
                 return AgentResult(agent=self.descriptor.name, agent_execution_id=execution_id,
                                    status=AgentStatus.FAILURE, summary="Document processing failed",
-                                   errors=[str(exc)[:500]])
+                                   errors=[err_msg])
         # Vision remains isolated to the configured provider and image payload;
         # timeout/cancellation errors are converted to structured failures.
         if AgentCapability.VISION in self.descriptor.capabilities:
@@ -305,7 +329,7 @@ class OllamaSpecialistAgent(BaseAgent):
                     # Vision models can require several minutes on low-end
                     # GPUs. Keep this isolated/configurable so other agent
                     # deadlines remain unchanged while still bounding hangs.
-                    vision_timeout = max(30.0, float(os.getenv("VISION_TIMEOUT_SECONDS", "360")))
+                    vision_timeout = max(30.0, float(os.getenv("VISION_TIMEOUT_SECONDS", "420")))
                     response = await asyncio.wait_for(
                         self.provider.chat([{"role": "user", "content": request.task}], encoded_images=encoded),
                         vision_timeout,
@@ -320,9 +344,10 @@ class OllamaSpecialistAgent(BaseAgent):
                                    status=AgentStatus.FAILURE, summary="Vision inference timed out",
                                    errors=["vision_timeout"], metadata=vision_meta)
             except Exception as exc:
+                err_msg = str(exc)[:500] or type(exc).__name__
                 return AgentResult(agent=self.descriptor.name, agent_execution_id=execution_id,
                                    status=AgentStatus.FAILURE, summary="Vision inference failed",
-                                   errors=[str(exc)[:500]], metadata=vision_meta)
+                                   errors=[err_msg], metadata=vision_meta)
         # Coding inspections must ground the model in source evidence.  Only
         # the explicitly allowlisted read_file tool is used in this phase.
         if AgentCapability.CODING in self.descriptor.capabilities and "read_file" in self.tools:
@@ -345,8 +370,9 @@ class OllamaSpecialistAgent(BaseAgent):
                     evidence.append(f"read_file:{candidate} ({len(content)} chars)")
                     artifacts.append(str(candidate))
                 except Exception as exc:
+                    err_msg = str(exc)[:500] or type(exc).__name__
                     return AgentResult(agent_execution_id=execution_id, status=AgentStatus.FAILURE,
-                                       summary="Unable to read requested source file", errors=[str(exc)[:500]])
+                                       summary="Unable to read requested source file", errors=[err_msg])
         read_only_request = bool(re.search(r"\bdo not (?:modify|edit|change)\b", request.task, re.I))
         mutation_request = (not read_only_request) and bool(re.search(r"\b(fix|edit|modify|change|write|create|save|implement|pytest|run tests?)\b", request.task, re.I))
         if mutation_request and AgentCapability.CODING in self.descriptor.capabilities:
@@ -409,10 +435,11 @@ class OllamaSpecialistAgent(BaseAgent):
                                        verification=verification,
                                        errors=[str(exc)[:500], "invalid_action_limit"])
                 except Exception as exc:
+                    err_msg = str(exc)[:500] or type(exc).__name__
                     return AgentResult(agent_execution_id=execution_id, status=AgentStatus.FAILURE,
                                        summary="Coding action was not valid", evidence=evidence,
                                        artifacts=artifacts, changes=changes, approvals=approvals,
-                                       verification=verification, errors=[str(exc)[:500]])
+                                       verification=verification, errors=[err_msg])
                 if action["action"] == "final":
                     if mutation_request and not changes:
                         return AgentResult(agent=self.descriptor.name, agent_execution_id=execution_id,
@@ -542,11 +569,26 @@ class OllamaSpecialistAgent(BaseAgent):
                     return result
             except (json.JSONDecodeError, ValueError):
                 pass
-            return AgentResult(agent= self.descriptor.name, agent_execution_id=execution_id, status=AgentStatus.SUCCESS, summary=raw[:4000], result=raw,
+            
+            # Fallback for LLMs that return arbitrary JSON instead of AgentResult
+            summary = raw[:4000]
+            try:
+                data = json.loads(raw)
+                if isinstance(data, dict):
+                    # Try to find a human-readable message field
+                    for key in ("answer", "message", "summary", "response", "text"):
+                        if key in data and isinstance(data[key], str):
+                            summary = data[key]
+                            break
+            except json.JSONDecodeError:
+                pass
+                
+            return AgentResult(agent=self.descriptor.name, agent_execution_id=execution_id, status=AgentStatus.SUCCESS, summary=summary, result=raw,
                                evidence=evidence, artifacts=artifacts)
         except Exception as exc:
+            err_msg = str(exc)[:500] or type(exc).__name__
             return AgentResult(agent=self.descriptor.name, agent_execution_id=execution_id, status=AgentStatus.FAILURE, summary="Agent execution failed",
-                               errors=[str(exc)[:500]])
+                               errors=[err_msg])
 
 
 class AgentRegistry:
@@ -648,7 +690,7 @@ class MasterAgent:
                  planner: Callable[..., Awaitable[list[dict[str, Any]]]] | None = None,
                  verifier: Callable[[AgentResult], Awaitable[dict[str, Any]]] | None = None,
                  policy: AgentCapabilityPolicy | None = None, max_master_steps: int = 10,
-                 max_subagent_calls: int = 8, max_depth: int = 2, total_timeout_seconds: float = 300.0,
+                 max_subagent_calls: int = 8, max_depth: int = 2, total_timeout_seconds: float = 360.0,
                  trace: list[dict[str, Any]] | None = None,
                  progress_callback: Callable[[dict[str, Any]], None] | None = None,
                  capability_matcher: CapabilityMatcher | None = None) -> None:

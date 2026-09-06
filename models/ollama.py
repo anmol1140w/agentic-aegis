@@ -64,18 +64,22 @@ class OllamaProvider(ModelProvider):
         messages: list[dict[str, Any]],
         **kwargs: Any,
     ) -> ModelResponse:
+        timeout_seconds = float(kwargs.get("timeout", 360.0))
+        clean_kwargs = {k: v for k, v in kwargs.items() if k not in ("image_paths", "encoded_images", "think", "options")}
         payload = self._chat_payload(
             messages, stream=False, image_paths=kwargs.get("image_paths"),
             encoded_images=kwargs.get("encoded_images"),
             think=bool(kwargs.get("think", False)),
+            options=kwargs.get("options"),
+            **clean_kwargs,
         )
         try:
-            async with httpx.AsyncClient(timeout=kwargs.get("timeout", 120.0)) as client:
+            async with httpx.AsyncClient(timeout=timeout_seconds) as client:
                 response = await client.post(f"{self.base_url}/api/chat", json=payload)
                 response.raise_for_status()
                 data = response.json()
         except httpx.TimeoutException as exc:
-            raise ModelTimeoutError(f"Ollama timed out after {kwargs.get('timeout', 120.0)}s") from exc
+            raise ModelTimeoutError(f"Ollama timed out after {timeout_seconds}s") from exc
         except (httpx.HTTPError, ValueError) as exc:
             raise ProviderError(f"Ollama chat request failed: {exc}") from exc
         content = str(data.get("message", {}).get("content", "")).strip()
@@ -95,12 +99,15 @@ class OllamaProvider(ModelProvider):
         self, messages: list[dict[str, Any]], **kwargs: Any
     ) -> AsyncIterator[dict[str, Any]]:
         """Stream Ollama thinking/content events without buffering the response."""
+        timeout_seconds = float(kwargs.get("timeout", 360.0))
+        clean_kwargs = {k: v for k, v in kwargs.items() if k not in ("image_paths", "encoded_images", "think", "options")}
         payload = self._chat_payload(
             messages, stream=True, image_paths=kwargs.get("image_paths"),
             encoded_images=kwargs.get("encoded_images"),
             think=bool(kwargs.get("think", False)),
+            options=kwargs.get("options"),
+            **clean_kwargs,
         )
-        timeout_seconds = float(kwargs.get("timeout", 120.0))
         received_output = False
         try:
             client_timeout = httpx.Timeout(timeout_seconds, connect=min(5.0, timeout_seconds))
@@ -139,6 +146,8 @@ class OllamaProvider(ModelProvider):
     def _chat_payload(
         self, messages: list[dict[str, Any]], *, stream: bool, image_paths: list[str] | None,
         encoded_images: list[str] | None = None, think: bool = False,
+        options: dict[str, Any] | None = None,
+        **kwargs: Any,
     ) -> dict[str, Any]:
         """Construct the documented Ollama ``/api/chat`` payload.
 
@@ -154,16 +163,22 @@ class OllamaProvider(ModelProvider):
                 payload_messages.append({"role": "user", "content": ""})
             target = next((m for m in reversed(payload_messages) if m["role"] == "user"), payload_messages[-1])
             target["images"] = encoded_images if encoded_images is not None else [_encode_image(path) for path in image_paths or []]
+        opts: dict[str, Any] = {"temperature": 0.7, "num_ctx": self.config.context_length}
+        if options and isinstance(options, dict):
+            opts.update(options)
+        for k in ("num_ctx", "num_predict", "temperature", "top_p", "top_k"):
+            if kwargs.get(k) is not None:
+                opts[k] = kwargs[k]
         return {"model": self.config.model, "messages": payload_messages, "stream": stream,
                 "think": think,
-                "options": {"temperature": 0.7, "num_ctx": self.config.context_length}}
+                "options": opts}
 
     # -- Health ---------------------------------------------------------
 
     async def health_check(self) -> bool:
         """Check Ollama is running and this model tag is pulled."""
         try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
+            async with httpx.AsyncClient(timeout=65.0) as client:
                 resp = await client.get(f"{self.base_url}/api/tags")
                 if resp.status_code != 200:
                     return False
