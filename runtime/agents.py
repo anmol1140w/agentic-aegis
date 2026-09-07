@@ -417,6 +417,11 @@ class OllamaSpecialistAgent(BaseAgent):
             request.task,
             re.I,
         ))
+        # Debug/fix requests must reproduce or validate the defect before a
+        # mutation is proposed. The existing command gate then requires a
+        # second verification after the edit.
+        diagnostic_fix_request = bool(re.search(r"\b(?:fix|debug|repair|error|bug|issue)\b", request.task, re.I))
+        requires_command = requires_command or diagnostic_fix_request
         repository_request = bool(re.search(r"\b(repository|repo|codebase|source\s+code|architecture)\b", request.task, re.I))
         inspection_request = bool(re.search(
             r"\b(inspect|find|search|list|summarize|structure|unsafe|regex|pattern|inventory|analy[sz]e)\b",

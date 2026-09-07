@@ -421,12 +421,6 @@ class WorkspaceReadTools:
                 "message": f"Expected {expected_matches} matches, found {count}.",
                 "path": rel_str,
             }
-        # Approval gate
-        active_approver = approver if approver is not None else getattr(self, "approver", None)
-        approved = False
-        if active_approver is not None:
-            approved = self._check_approval(active_approver, rel_str, old_text, new_text)
-
         new_content = content.replace(old_text, new_text, expected_matches)
         import difflib
         diff = "".join(difflib.unified_diff(content.splitlines(True), new_content.splitlines(True),
@@ -435,6 +429,13 @@ class WorkspaceReadTools:
             return {"ok": True, "status": "success", "tool": "edit_file", "path": rel_str,
                     "changed": new_content != content, "matches": count, "diff": diff,
                     "dry_run": True}
+
+        # Approval is requested only after all deterministic validation and
+        # preflight checks pass. A dry-run must never trigger a human prompt.
+        active_approver = approver if approver is not None else getattr(self, "approver", None)
+        approved = False
+        if active_approver is not None:
+            approved = self._check_approval(active_approver, rel_str, old_text, new_text)
 
         if not approved:
             return {
