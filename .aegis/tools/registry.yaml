@@ -1,0 +1,12 @@
+version: "1"
+runtime: tools.runtime.ToolRuntime
+namespaces:
+  workspace.read: [list, tree, read, find, search, stat, context]
+  workspace.change: [edit, create]
+  workspace.run: [command]
+  workspace.verify: [status, diff]
+  workspace.checkpoint: [create, list, restore]
+policy:
+  workspace_scoped: true
+  external_side_effect_default: deny
+  destructive_default: approval_required

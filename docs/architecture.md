@@ -1,180 +1,53 @@
-# AEGIS Architecture — Current Status
+# AEGIS architecture — authoritative current version
 
-AEGIS is the local Master-first workbench. The CLI and FastAPI service use the
-same `Orchestrator.run_master` path, which enters one universal LangGraph task
-graph. The registry selects specialists and the policy layer authorizes tools.
-The former classifier/router remains only as a deprecated compatibility surface
-for older library callers and is not invoked by normal CLI/API execution.
+AEGIS has one production execution boundary: `Orchestrator.run_master`.
+The CLI and FastAPI API both enter the same universal task graph. The legacy
+classifier graph remains only for compatibility with older library callers.
 
 ```text
-CLI or FastAPI → NLP → MasterAgent → AgentRegistry → Specialist
-→ Policy/Approval → bounded tools and pipelines → AgentResult
-→ Master review/verification/replan → persisted result and trace
+CLI/API
+  → NLP normalization
+  → MasterAgent plan and capability routing
+  → AgentRegistry specialist
+  → typed ToolRegistry + path/command/approval policy
+  → workspace tool or local sandbox
+  → observation and read-back
+  → deterministic verification
+  → independent review
+  → bounded repair or safe failure
+  → result, trace, network report, evidence
 ```
 
-Available specialists: coding (`qwen2.5-coder:7b`), document/general
-(`qwen3.5:9b`), vision (`qwen3-vl:8b`), and lightweight (`llama3.2:1b`).
-Document creation supports DOCX, PDF, Markdown, and TXT with artifact
-verification. RAG, cloud APIs, arbitrary shell, delete, and Git mutation are
-not enabled. See `docs/aegis-api.md` for the HTTP boundary.
+## Runtime ownership
 
----
+| Layer | Owns |
+|---|---|
+| MasterAgent | request interpretation, plan, specialist selection, delegation, review |
+| AgentRegistry | specialist roles, model aliases, allowed tools |
+| ToolRegistry/runtime | schemas, risk, approval, timeout, audit identity |
+| WorkspaceReadTools | canonical `./workspace` paths, file changes, commands, checkpoints |
+| RepositoryIndex | SQLite metadata, symbols, imports, tests, config, relevance ranking |
+| Verification/reviewer | exit codes, changed-file evidence, read-back, diff and policy checks |
+| NetworkMonitor | live sockets plus named local/external model/tool counters |
 
-## 1. System Topology
+Every action follows `decide → validate → execute → observe → update → verify`.
+Mutations are serialized, checkpoint-protected, approval-gated, and never
+performed concurrently.
 
-AEGIS — Sovereign Agent Workbench is structured into distinct, modular, and loosely-coupled layers:
+## Agents
 
-```text
-                                 USER
-                                  │
-                                  ▼
-                         ┌─────────────────┐
-                         │  Terminal CLI   │
-                         │    (cli.py)     │
-                         └────────┬────────┘
-                                  │
-                                  ▼
-                         ┌─────────────────┐
-                         │  Agent Runtime  │  LangGraph StateGraph
-                         │ (orchestrator)  │  Checkpoints (Memory/SQLite)
-                         └────────┬────────┘
-                                  │
-                   ┌─────────────────────────────┐
-                   ▼                             │
-        ┌─────────────────────┐                  │
-        │ MasterAgent /       │                  │
-        │ Agent Registry      │──────────────────┘
-        └──────────┬──────────┘
-                   │
-                   ┌─────────────────────────────┼─────────────────────────────┐
-                   ▼                             ▼                             ▼
-          ┌─────────────────┐           ┌─────────────────┐           ┌─────────────────┐
-          │   General LLM   │           │   Coding LLM    │           │   Vision LLM    │
-          │    (Qwen 3)     │           │ (Qwen2.5-Coder) │           │   (Qwen2.5-VL)  │
-          └────────┬────────┘           └────────┬────────┘           └────────┬────────┘
-                   │                             │                             │
-                   └─────────────────────────────┼─────────────────────────────┘
-                                                 │
-                                                 ▼
-                                      ┌─────────────────────┐
-                                      │    Tool Runtime     │
-                                      │   & Tool Registry   │
-                                      └──────────┬──────────┘
-                                                 │
-                   ┌─────────────────────────────┼─────────────────────────────┐
-                   ▼                             ▼                             ▼
-          ┌─────────────────┐           ┌─────────────────┐           ┌─────────────────┐
-          │   Calculator    │           │   File System   │           │  Code Sandbox   │
-          │ (AST Evaluator) │           │ (Path Guarded)  │           │(Docker Isolate) │
-          └────────┬────────┘           └────────┬────────┘           └────────┬────────┘
-                   │                             │                             │
-                   └─────────────────────────────┼─────────────────────────────┘
-                                                 │
-                                                 ▼
-                                      ┌─────────────────────┐
-                                      │  State Persistence  │
-                                      │   & Audit Logging   │
-                                      └─────────────────────┘
-```
+- `master_agent`: only production orchestrator.
+- `coding_agent`: source inspection, edits, targeted tests, bounded repair.
+- `document_agent`: local PDF/DOCX/PPTX/TXT workflows and artifact verification.
+- `vision_agent`: local image preprocessing and Ollama vision analysis.
+- `general_agent`: non-specialized local reasoning.
 
----
+The former lightweight route is not an initial handoff. The master routes
+directly to a real specialist and sends the result back through verification.
 
-## 2. Core Architectural Principles
+## Boundaries
 
-1. **Deterministic Logic Over LLM Operating System:**
-   - Meta-decisions (such as identifying that a user is asking for mathematical calculation or providing an image) are computed via deterministic pattern matchers and heuristics rather than consuming GPU cycles.
-   - Calculations and file operations execute directly via deterministic Python tools.
-
-2. **Strict Air-Gap & Sovereignty:**
-   - The system assumes `Internet = Unavailable`.
-   - All models run through local inference engines (Ollama initially, expandable to vLLM or llama.cpp).
-   - Zero telemetry, zero external API dependencies.
-
-3. **Single Orchestrator with Modular Graph Nodes:**
-   - Rather than dozens of uncontrolled autonomous agents interacting chaotically, a single LangGraph `StateGraph` orchestrates the task lifecycle:
-     - `classify`: Ingests user input and attachments to produce a typed `Task`.
-     - `route`: Evaluates model registry candidates against the `Task` to choose the optimal provider.
-     - `execute`: Binds active tools to the chosen model and invokes the model with full event streaming.
-
----
-
-## 3. Universal LangGraph Task Flow
-
-```text
-[START] → normalize_request → classify_and_route → create_plan
-   → validate_plan → execute_step → record_step_result → verify_plan
-   ├── verified → review_and_finish
-   └── recoverable failure → structured self_heal → execute_step (bounded)
-   └── unsafe/unrecoverable → safe_failure
-
-Coding tool calls use the same bounded task semantics through the native
-coding subgraph (`reason → validate_action → execute_tool → record_result →
-verify_plan → self_heal`). Document and vision delegation now enter the
-universal graph as well; no specialist is called directly by the CLI.
-```
-
-State is managed by `AgentState`:
-- `messages`: Conversation history with LangChain `add_messages` reducer.
-- `task`: Strongly typed `Task` object.
-- `selected_model`: Selected model key and tag.
-- `trace`: Monotonically appended execution steps (`TraceEntry`).
-- `errors`: Monotonically appended system or tool errors.
-
-## 4. Master-first migration
-
-### Pre-RAG NLP boundary
-
-User and OCR text first passes through the lightweight deterministic
-`NLPPreprocessor`. It preserves `original_text`, produces a conservative
-`normalized_text`/`enhanced_prompt`, extracts bounded entities and intent, and
-records correction confidence and timing. The Master receives both the
-original request and this structured preprocessing context; NLP never selects
-agents or executes tools. Raw OCR remains evidence while normalized OCR is
-used for reasoning.
-
-```text
-USER / OCR → NLP PREPROCESSOR → MASTER → REGISTRY → SPECIALIST → POLICY → TOOLS
-```
-
-The insertion point after preprocessing is intentionally reserved for a
-future retrieval layer. RAG, embeddings, chunk retrieval, and vector storage
-are deferred and are not part of execution today.
-
-All CLI requests use the capability-driven `MasterAgent`; `/master <request>`
-remains an explicit diagnostic entry point using the same implementation. The
-master plans using registry capabilities, delegates isolated `AgentRequest`
-objects, reviews structured `AgentResult` values, persists a master trace, and
-returns a structured failure when planning or delegation cannot complete.
-
-```text
-USER → CLI → MASTER → REGISTRY → SPECIALIST → POLICY → TOOL → RESULT → REVIEW
-                                      │
-                                      └── failure → structured Master failure
-```
-
-The master never receives unrestricted mutation tools. Specialists use the
-existing workspace path guards, command allowlist, approval callbacks, and
-network policy. File mutation, arbitrary shell, Git mutation, and RAG remain
-explicitly outside the current master capability set. The former classifier
-and router are retained only as library compatibility surfaces and are not
-invoked by the CLI or Master workflow.
-
-The optional `tools.mcp_adapter.AegisMCPAdapter` exposes the same registered
-tools through an MCP-shaped local interface; it delegates to ToolRegistry and
-does not create a second executor or server. A network MCP transport is not
-required for the local deployment. Desktop capture and computer-use actions
-are intentionally disabled pending the dedicated review in
-`docs/computer-use-security-review.md`.
-
-## 5. Evidence-driven task execution
-
-Multi-step coding/workspace runs carry typed task and step contracts from
-`runtime/task_state.py`. Plans are parsed and checked by
-`runtime/plan_parser.py`; unknown tools, malformed parameters, excessive steps,
-and duplicate identifiers are rejected before execution. Every real tool
-result is persisted in graph state, then checked by deterministic verification
-(`runtime/verification.py`). Recoverable failures are classified by
-`runtime/self_healing.py` and may return to the bounded model/tool loop;
-approval denials, path violations, and policy failures are never retried as
-though they were transient errors. Final success requires evidence, not model
-claims.
+The canonical user workspace is `./workspace`; no tool may resolve outside it.
+The default command backend is a sanitized process group. Docker and Linux
+Bubblewrap are optional adapters. C++17 process lifecycle code in `native/` is
+an optional helper; Python remains the portable fallback.

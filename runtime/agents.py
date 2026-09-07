@@ -8,6 +8,7 @@ workflow through :class:`MasterAgent`.
 from __future__ import annotations
 
 import json
+import ast
 import time
 import uuid
 import asyncio
@@ -31,7 +32,8 @@ from runtime.actions import ActionParseError, parse_action
 from runtime.errors import ModelTimeoutError
 from runtime.self_healing import classify_failure
 from tools.vision import VisionPreprocessor
-from runtime.prompts import document_prompt, planning_prompt, specialist_prompt
+from runtime.prompts import agentic_loop_prompt, document_prompt, handoff_prompt, planning_prompt, specialist_prompt
+from runtime.lightweight_router import LightweightTaskRouter, LightweightClassificationError, TaskClassification
 
 
 class AgentStatus(str, Enum):
@@ -161,6 +163,16 @@ class OllamaSpecialistAgent(BaseAgent):
         self.provider = provider
         self.tools = tools or {}
         self.progress_callback = progress_callback
+        self.model_call_callback: Callable[..., Any] | None = None
+        self.tool_call_callback: Callable[..., Any] | None = None
+
+    def _observe_model_call(self) -> None:
+        if self.model_call_callback:
+            self.model_call_callback(model=self.provider.model_id, local=True)
+
+    def _observe_tool_call(self, name: str) -> None:
+        if self.tool_call_callback:
+            self.tool_call_callback(tool=name, local=True)
 
     async def run(self, request: AgentRequest) -> AgentResult:
         execution_id = request.agent_execution_id or f"exec_{uuid.uuid4().hex[:12]}"
@@ -200,6 +212,7 @@ class OllamaSpecialistAgent(BaseAgent):
                         try:
                             raw_ctx = getattr(getattr(self.provider, "config", None), "context_length", None)
                             ctx_limit = min(raw_ctx, 4096) if isinstance(raw_ctx, int) else 4096
+                            self._observe_model_call()
                             response = await asyncio.wait_for(
                                 self.provider.generate(
                                     generation_prompt,
@@ -329,6 +342,7 @@ class OllamaSpecialistAgent(BaseAgent):
                     # GPUs. Keep this isolated/configurable so other agent
                     # deadlines remain unchanged while still bounding hangs.
                     vision_timeout = max(30.0, float(os.getenv("VISION_TIMEOUT_SECONDS", "420")))
+                    self._observe_model_call()
                     response = await asyncio.wait_for(
                         self.provider.chat([{"role": "user", "content": request.task}], encoded_images=encoded),
                         vision_timeout,
@@ -349,13 +363,13 @@ class OllamaSpecialistAgent(BaseAgent):
                                    errors=[err_msg], metadata=vision_meta)
         # Coding inspections must ground the model in source evidence.  Only
         # the explicitly allowlisted read_file tool is used in this phase.
+        creation_intent = bool(re.search(
+            r"\b(create|write|generate|make|new)\b.*\b(?:file|script|program|module)\b",
+            request.task,
+            re.I,
+        ))
+        candidate = request.context.get("path")
         if AgentCapability.CODING in self.descriptor.capabilities and "read_file" in self.tools:
-            candidate = request.context.get("path")
-            creation_intent = bool(re.search(
-                r"\b(create|write|generate|make|new)\b.*\b(?:file|script|program|module)\b",
-                request.task,
-                re.I,
-            ))
             if not candidate and re.search(r"\b(inspect|read|open|review|fix|edit|modify|change)\b", request.task, re.I):
                 match = re.search(r"([\w./-]+\.(?:py|js|ts|rs|go|java|c|cpp|h))", request.task)
                 candidate = match.group(1) if match else None
@@ -381,7 +395,7 @@ class OllamaSpecialistAgent(BaseAgent):
                         return AgentResult(agent_execution_id=execution_id, status=AgentStatus.FAILURE,
                                            summary="Unable to read requested source file", errors=[str(source.get("error", "read failed"))])
                     content = source.get("content", "") if isinstance(source, dict) else str(source)
-                    evidence.append(f"read_file:{candidate} ({len(content)} chars)")
+                    evidence.append((f"read_file:{candidate} ({len(content)} chars)")[:4000])
                     artifacts.append(str(candidate))
                 except Exception as exc:
                     err_msg = str(exc)[:500] or type(exc).__name__
@@ -403,7 +417,12 @@ class OllamaSpecialistAgent(BaseAgent):
             re.I,
         ))
         repository_request = bool(re.search(r"\b(repository|repo|codebase|source\s+code|architecture)\b", request.task, re.I))
-        if (mutation_request or command_request or repository_request) and AgentCapability.CODING in self.descriptor.capabilities:
+        inspection_request = bool(re.search(
+            r"\b(inspect|find|search|list|summarize|structure|unsafe|regex|pattern|inventory|analy[sz]e)\b",
+            request.task, re.I,
+        ))
+        inspection_capable = any(name in self.tools for name in ("repository_context", "tree", "search_files", "find_files"))
+        if (mutation_request or command_request or repository_request or (inspection_request and inspection_capable)) and AgentCapability.CODING in self.descriptor.capabilities:
             # The model may propose actions, but infrastructure validates and
             # executes only descriptor-allowlisted tools. Approval is delegated
             # to WorkspaceReadTools; this layer never grants it implicitly.
@@ -444,6 +463,8 @@ class OllamaSpecialistAgent(BaseAgent):
                 dict(item) for item in prior_state.get("commands", [])[-12:]
                 if isinstance(item, dict)
             ]
+            rejected_creation_reads = 0
+            repository_context_loaded = False
 
             def coding_state_snapshot() -> dict[str, Any]:
                 """Return compact state for a graph-level repair invocation."""
@@ -459,13 +480,17 @@ class OllamaSpecialistAgent(BaseAgent):
                     "completed_action_states": list(completed_action_states)[-24:],
                     "commands": command_history[-12:],
                 }
-            if repository_request and "repository_context" in self.tools:
+            # Context discovery is infrastructure-owned for every repository
+            # task. This gives the model real filenames before it can choose a
+            # read path and prevents guesses such as task_directory/.
+            if (repository_request or mutation_request or command_request or inspection_request) and "repository_context" in self.tools:
                 try:
                     if self.progress_callback:
                         self.progress_callback({"event": "tool_requested", "agent": self.descriptor.name,
                                                 "tool": "repository_context", "arguments": {}, "status": "requested"})
                     context_result = self.tools["repository_context"]()
                     if isinstance(context_result, dict) and context_result.get("ok"):
+                        repository_context_loaded = True
                         evidence.append(
                             f"repository_context:{context_result.get('file_count', 0)} files "
                             f"under {context_result.get('root', '')}"
@@ -525,6 +550,9 @@ class OllamaSpecialistAgent(BaseAgent):
             # the listing result.
             if isinstance(prior_last_tool_result, dict):
                 last_tool_result = dict(prior_last_tool_result)
+            # A normal repair cycle may need read -> command -> diagnosis ->
+            # edit -> command -> final. Keep it bounded but large enough for
+            # that complete evidence-backed sequence.
             for _ in range(8):
                 if created_paths:
                     post_create_steps += 1
@@ -540,61 +568,61 @@ class OllamaSpecialistAgent(BaseAgent):
                         )
                 try:
                     coding_timeout = max(30.0, float(os.getenv("CODING_STEP_TIMEOUT_SECONDS", "180")))
-                    if not saw_read:
-                        phase_instruction = "The next action MUST be a targeted read_file or list_directory action."
+                    if creation_intent and not candidate:
+                        phase_instruction = (
+                            "This is a new-file request without a named existing source file. "
+                            "Do not call read_file on guessed paths such as task_directory or task/. "
+                            "Choose one safe filename from the request, call create_file or create_python_script "
+                            "directly, then rely on infrastructure read-back verification."
+                        )
+                    elif inspection_request and not saw_read:
+                        phase_instruction = (
+                            "This is an inspection task. Use find_files or search_files first with a real pattern "
+                            "from the task (for example *.py or regex), then read only relevant matches. "
+                            "Do not guess filenames or report an exhaustive result without search evidence."
+                        )
+                    elif not saw_read:
+                        phase_instruction = (
+                            "The next action MUST read one existing path from repository_context.files or use "
+                            "list_directory with an established directory. Never invent task_directory, task/, "
+                            "failing_test.py, or implementation.py."
+                            if repository_context_loaded else
+                            "The next action MUST be repository_context, tree, list_directory, search_files, or "
+                            "find_files; do not guess a file path."
+                        )
                     elif requires_command and not command_executed:
                         phase_instruction = "Source evidence is already available. The next action MUST execute the baseline test or command; do not read files again."
                     elif command_executed and verification.get("status") == "failed":
                         phase_instruction = "The last command failed. Diagnose its stderr/stdout and edit the implementation or tests before retrying; do not repeat the same failed command unchanged."
                     else:
                         phase_instruction = "Use the existing evidence, make only necessary edits, rerun verification, and then finalize."
-                    coding_prompt = json.dumps({
-                            "task": request.task,
-                            "evidence": evidence[-4:],
-                            "last_tool_result": last_tool_result,
-                            "working_memory": {
-                                "files_read": dict(list(known_files.items())[-3:]),
-                                "implementation_candidates": [
-                                    path for path in known_files
-                                    if not Path(path).name.startswith("test_")
-                                    and "/tests/" not in path
-                                ][-6:],
-                                "files_modified": changes[-8:],
-                                "commands_and_failures": [
-                                    item for item in evidence
-                                    if item.startswith(("execute_command:", "failure:", "duplicate_action:"))
-                                ][-8:],
-                            },
-                            "available_tools": {
-                                "read_file": {"required": ["path"]},
-                                "list_directory": {"required": [], "optional": ["path"]},
-                                "tree": {"required": [], "optional": ["path", "max_depth", "max_entries", "include_hidden", "include_generated"]},
-                                "search_files": {"required": ["query"], "optional": ["path"]},
-                                "find_files": {"required": ["pattern"], "optional": ["path"]},
-                                **({} if repository_request else {"repository_context": {"required": []}}),
-                                "create_file": {"required": ["path", "content"]},
-                                "create_python_script": {"required": ["path", "content"]},
-                                "edit_file": {"required": ["path", "old_text", "new_text"]},
-                                "execute_command": {"required": ["command"], "optional": ["cwd"]},
-                            },
-                            "instruction": (
-                                "Return exactly one JSON object and no prose. For a workspace operation use "
-                                '{"action":"tool","tool":"<allowed tool>","arguments":{...}}. '
-                                "For a final response use {\"action\":\"final\",\"answer\":\"...\"}. "
-                                "Repository context has already been loaded by infrastructure; do not repeat "
-                                "repository_context. Start with targeted read_file evidence from the named task "
-                                "directory, then execute the requested test/command before editing. "
-                                f"{phase_instruction} "
-                                "To create the requested program, call create_file before claiming success. "
-                                "If the requested file already exists, read it and continue with the requested "
-                                "execute_command; do not repeat create_file after a file_exists result. "
-                                "When a test fails, preserve the test and repair the implementation unless the "
-                                "failure proves the test is incorrect. Use exact source text from working_memory "
-                                "for old_text; do not invent paths or test files. For a failed test, the next "
-                                "useful action is to inspect or edit one of working_memory.implementation_candidates, "
-                                "not to alter the test merely to make it pass."
-                            ),
-                        })
+                    allowed_tools = {
+                        "read_file": {"required": ["path"]},
+                        "list_directory": {"required": [], "optional": ["path"]},
+                        "tree": {"required": [], "optional": ["path", "max_depth", "max_entries", "include_hidden", "include_generated"]},
+                        "search_files": {"required": ["query"], "optional": ["path"]},
+                        "find_files": {"required": ["pattern"], "optional": ["path"]},
+                        "repository_context": {"required": []},
+                        "create_file": {"required": ["path", "content"]},
+                        "create_python_script": {"required": ["path", "content"]},
+                        "edit_file": {"required": ["path", "old_text", "new_text"]},
+                        "execute_command": {"required": ["command"], "optional": ["cwd"]},
+                    }
+                    coding_prompt = agentic_loop_prompt(
+                        role=self.descriptor.role, task=request.task, phase=phase_instruction,
+                        state_version=state_version, observation={"last_tool_result": last_tool_result,
+                                                                  "evidence": evidence[-8:]},
+                        facts={"files_read": dict(list(known_files.items())[-3:]),
+                               "implementation_candidates": [path for path in known_files
+                                   if not Path(path).name.startswith("test_") and "/tests/" not in path][-6:],
+                               "files_modified": changes[-8:]},
+                        allowed_tools=allowed_tools, completed_actions=list(completed_action_states),
+                        next_requirement=phase_instruction,
+                        success_criteria=request.success_criteria,
+                               handoff={"execution_id": request.agent_execution_id, "repair": bool(prior_state),
+                                        "master_handoff": request.context.get("handoff_prompt", "")},
+                    )
+                    coding_prompt += "\nReturn no prose. Use only the exact JSON action schema."
                     # JSON is the machine contract, but a short labeled
                     # evidence block makes failure diagnosis reliable for
                     # local models that under-attend to deeply nested fields.
@@ -617,6 +645,7 @@ class OllamaSpecialistAgent(BaseAgent):
                         streamed: list[str] = []
                         activity_total = 0
                         last_activity = time.monotonic()
+                        self._observe_model_call()
                         stream_events = self.provider.stream_chat_events(
                             [{"role": "user", "content": coding_prompt}],
                             # Ollama's explicit thinking channel is supported
@@ -648,6 +677,7 @@ class OllamaSpecialistAgent(BaseAgent):
                                                      "kind": "decision_complete", "token_count": activity_total})
                         response_content = "".join(streamed)
                     else:
+                        self._observe_model_call()
                         response = await asyncio.wait_for(self.provider.generate(coding_prompt), timeout=coding_timeout)
                         response_content = response.content
                     action = parse_action(response_content)
@@ -685,6 +715,43 @@ class OllamaSpecialistAgent(BaseAgent):
                                            summary="Workspace change was not read back and verified",
                                            evidence=evidence, artifacts=artifacts, changes=changes,
                                            verification=verification, errors=["post_write_verification_required"])
+                    # A model can correctly mutate the workspace and still
+                    # stop one action early. For explicit test requests, do
+                    # one bounded infrastructure-owned evidence check rather
+                    # than spending the graph repair budget on an identical
+                    # model retry. Approval, sandbox policy, and command
+                    # validation remain owned by the workspace tool.
+                    if (requires_command and not command_executed and
+                            re.search(r"\b(test|tests|pytest|unittest)\b", request.task, re.I) and
+                            "execute_command" in self.tools):
+                        try:
+                            evidence.append("infrastructure_test_fallback:pytest -q")
+                            fallback = await asyncio.to_thread(
+                                self.tools["execute_command"], command="pytest -q", cwd="."
+                            )
+                            if isinstance(fallback, dict):
+                                fallback_status = fallback.get("status", "success" if fallback.get("ok") else "failure")
+                                command_executed = True
+                                verification = {
+                                    "required": True, "command": "pytest -q",
+                                    "status": "passed" if fallback_status == "success" and fallback.get("exit_code", 0) == 0 else "failed",
+                                }
+                                command_history.append({
+                                    "command": "pytest -q", "cwd": ".",
+                                    "exit_code": fallback.get("exit_code"),
+                                    "stdout": str(fallback.get("stdout", ""))[-4000:],
+                                    "stderr": str(fallback.get("stderr", ""))[-4000:],
+                                    "timed_out": bool(fallback.get("timed_out", False)),
+                                    "state_version": state_version,
+                                })
+                                if verification["status"] == "passed":
+                                    return AgentResult(agent=self.descriptor.name, agent_execution_id=execution_id,
+                                                       status=AgentStatus.SUCCESS, summary=action["answer"],
+                                                       evidence=evidence, artifacts=artifacts, changes=changes,
+                                                       approvals=approvals, verification=verification,
+                                                       metadata={"coding_state": coding_state_snapshot()})
+                        except Exception as exc:
+                            evidence.append(f"infrastructure_test_fallback_error:{type(exc).__name__}")
                     if requires_command and (not command_executed or verification.get("status") != "passed"):
                         if _ < 7:
                             evidence.append("execution_required:successful execute_command before final")
@@ -712,10 +779,45 @@ class OllamaSpecialistAgent(BaseAgent):
                     return AgentResult(agent_execution_id=execution_id, status=AgentStatus.BLOCKED,
                                        summary="Tool is not permitted for this agent", evidence=evidence,
                                        errors=[f"unauthorized tool: {name}"])
+                if name == "read_file" and creation_intent and not candidate and not created_paths:
+                    rejected_creation_reads += 1
+                    hint = (
+                        "No existing source file was named for this creation request. "
+                        "Do not guess a path; create the requested file directly."
+                    )
+                    evidence.append("invalid_creation_read:path_not_established")
+                    last_tool_result = {"tool": name, "status": "failure", "ok": False,
+                                        "error": "path_not_established", "retryable": rejected_creation_reads < 2,
+                                        "message": hint}
+                    if rejected_creation_reads >= 2:
+                        return AgentResult(agent_execution_id=execution_id, status=AgentStatus.BLOCKED,
+                                           summary="Creation stopped after repeated invented paths",
+                                           evidence=evidence, artifacts=artifacts, changes=changes,
+                                           approvals=approvals, verification=verification,
+                                           errors=["path_not_established"])
+                    continue
                 action_key = json.dumps({"tool": name, "arguments": args}, sort_keys=True, default=str)
                 state_key = (name, action_key, state_version)
                 state_key_text = json.dumps(state_key, default=str)
                 action_state_counts[state_key] = action_state_counts.get(state_key, 0) + 1
+                # A successful create is a terminal mutation for a creation
+                # task. If the model proposes the same create again, do not
+                # call the filesystem and wait for repeated file_exists
+                # failures; the first write plus read-back is authoritative.
+                if name in {"create_file", "create_python_script"} and str(args.get("path", "")) in created_paths:
+                    repeated_path = str(args.get("path", ""))
+                    evidence.append(f"duplicate_mutation:{name}:{repeated_path}")
+                    last_tool_result = {"tool": name, "status": "failure", "ok": False,
+                                        "error": "duplicate_mutation", "retryable": False,
+                                        "message": "File was already created and verified; use read-back evidence."}
+                    if not requires_command:
+                        return AgentResult(agent=self.descriptor.name, agent_execution_id=execution_id,
+                                           status=AgentStatus.SUCCESS,
+                                           summary=f"Created and verified {repeated_path}.",
+                                           evidence=evidence, artifacts=artifacts, changes=changes,
+                                           approvals=approvals, verification=verification,
+                                           metadata={"coding_state": coding_state_snapshot()})
+                    continue
                 if (state_key_text in completed_action_states or action_state_counts[state_key] >= 2) and name in {
                     "read_file", "list_directory", "tree", "repository_context", "search_files", "find_files", "execute_command"
                 }:
@@ -769,6 +871,7 @@ class OllamaSpecialistAgent(BaseAgent):
                                        summary="read_file is required before edit_file", evidence=evidence,
                                        errors=["edit-before-read blocked"])
                 try:
+                    self._observe_tool_call(name)
                     if name == "execute_command":
                         if self.progress_callback:
                             self.progress_callback({"event": "sandbox_preflight", "agent": self.descriptor.name,
@@ -849,12 +952,24 @@ class OllamaSpecialistAgent(BaseAgent):
                                     saw_read = True
                                     verification["status"] = "verified"
                                     known_files[created_path] = str(readback.get("content", ""))[:3500]
-                                    evidence.append(f"post_create_readback:{created_path}")
+                                    evidence.append((f"post_create_readback:{created_path}")[:4000])
                                 else:
                                     verification["status"] = "failed"
+                                    evidence.append((f"post_create_readback_error:{created_path}:readback_failed")[:4000])
                             except Exception as exc:
                                 verification["status"] = "failed"
                                 evidence.append(f"post_create_readback_error:{str(exc)[:120]}")
+                        # Syntax validation is deterministic and must not spend
+                        # a command/model call or execute arbitrary generated
+                        # code merely to prove that it parses.
+                        if verification["status"] == "verified" and created_path.endswith('.py'):
+                            created_content = known_files.get(created_path, "")
+                            try:
+                                ast.parse(created_content, filename=created_path)
+                                evidence.append((f"syntax_validation:{created_path}:passed")[:4000])
+                            except SyntaxError as exc:
+                                verification["status"] = "failed"
+                                evidence.append((f"syntax_validation:{created_path}:failed:{exc.msg}")[:4000])
                     elif (name in {"create_file", "create_python_script"}
                           and status != "success"
                           and result.get("error") == "file_exists"):
@@ -928,6 +1043,7 @@ class OllamaSpecialistAgent(BaseAgent):
             expected_output="a JSON object matching AgentResult",
         )
         try:
+            self._observe_model_call()
             response = await self.provider.generate(prompt)
             raw = response.content.strip()
             try:
@@ -1060,6 +1176,7 @@ class MasterAgent:
     """Bounded PLAN → DELEGATE → REVIEW → VERIFY → FINAL workflow."""
 
     def __init__(self, registry: AgentRegistry, *, master_provider: ModelProvider | None = None,
+                 lightweight_router_provider: ModelProvider | None = None,
                  planner: Callable[..., Awaitable[list[dict[str, Any]]]] | None = None,
                  verifier: Callable[[AgentResult], Awaitable[dict[str, Any]]] | None = None,
                  policy: AgentCapabilityPolicy | None = None, max_master_steps: int = 10,
@@ -1068,6 +1185,12 @@ class MasterAgent:
                  progress_callback: Callable[[dict[str, Any]], None] | None = None,
                  capability_matcher: CapabilityMatcher | None = None) -> None:
         self.registry, self.master_provider, self.planner, self.verifier = registry, master_provider, planner, verifier
+        self.lightweight_router_provider = lightweight_router_provider
+        self.model_call_callback: Callable[..., Any] | None = None
+        self.lightweight_router = None
+        if lightweight_router_provider is not None and registry is not None:
+            self.lightweight_router = LightweightTaskRouter(
+                lightweight_router_provider, agent_capabilities=registry.capabilities())
         self.policy = policy or AgentCapabilityPolicy()
         self.max_master_steps = min(10, max(1, max_master_steps))
         self.max_subagent_calls = min(8, max(1, max_subagent_calls))
@@ -1082,6 +1205,19 @@ class MasterAgent:
             CapabilityProfile("code_debugging", "read, debug, edit source code and run tests", "coding_agent", "text", ("patch",)),
             CapabilityProfile("general_reasoning", "answer general questions and summarize information", "general_agent", "text", ("text",)),
         ])
+
+    async def route_request(self, request: str, *, context: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+        """Select the next specialist from the master-owned routing path.
+
+        The lightweight classifier remains available for compatibility, but it
+        is not placed before the master anymore. Every request is classified by
+        the master and then enters the normal plan, delegation, and verification
+        loop.
+        """
+        plan = self._capability_plan(request)
+        for item in plan:
+            item.setdefault("routing_source", "master_agent")
+        return plan
 
     def _event(self, event: str, state: MasterTaskState, **meta: Any) -> None:
         self.trace.append({"event": event, "trace_id": state.trace_id,
@@ -1098,8 +1234,8 @@ class MasterAgent:
         output = output_match.group(1) if output_match else None
         modality = "image" if re.search(r"\b(image|p&id|diagram|visual)\b", text) else "document" if re.search(r"\b(pdf|document|report|ocr|markdown|md|txt)\b", text) else None
         code_intent = bool(re.search(
-            r"\b(source\s+code|code|coding|python|test|tests|pytest|compile|compilation|debug|debugging|"
-            r"fix|repair|implement|implementation|function|module|script)\b|"
+            r"\b(source\s+code|code|coding|python|py\s+file|test|tests|pytest|compile|compilation|debug|debugging|"
+            r"fix|repair|implement|implementation|function|module|script|red[- ]?black|rb\s+trees?)\b|"
             r"\.(py|js|ts|rs|go|java|c|cpp|h)\b",
             text,
         ))
@@ -1147,7 +1283,9 @@ class MasterAgent:
             return [{"agent": "coding_agent", "task": request,
                      "success_criteria": ["source evidence and analysis"]}]
         if len(text.split()) <= 12:
-            return [{"agent": "lightweight_agent", "task": request}]
+            return [{"agent": "general_agent", "task": request,
+                     "capability": "general_reasoning",
+                     "success_criteria": ["master-reviewed response"]}]
         return [{"agent": "general_agent", "task": request}]
 
     async def delegate_to_agent(
@@ -1177,7 +1315,15 @@ class MasterAgent:
         except KeyError as exc:
             return AgentResult(agent_execution_id=execution_id, status=AgentStatus.BLOCKED,
                                summary="Unknown agent", errors=[str(exc)])
-        request = AgentRequest(task=task, context=context or {}, constraints=constraints or [],
+        handoff_context = dict(context or {})
+        handoff_context["handoff_prompt"] = handoff_prompt(
+            from_role="master_agent", to_role=agent, task=task,
+            objective=(success_criteria or ["produce structured evidence"])[0],
+            state=handoff_context.get("agent_state", {}),
+            observation=handoff_context.get("last_observation", handoff_context.get("observation", {})),
+            allowed_tools=handoff_context.get("allowed_tools", []),
+        )
+        request = AgentRequest(task=task, context=handoff_context, constraints=constraints or [],
                                expected_output=expected_output, success_criteria=success_criteria or [],
                                trace_id=trace_id or uuid.uuid4().hex, depth=depth,
                                agent_execution_id=execution_id)
@@ -1230,6 +1376,8 @@ class MasterAgent:
                 prompt = planning_prompt(
                     capabilities=self.registry.capabilities(), request=planning_request
                 )
+                if self.model_call_callback:
+                    self.model_call_callback(model=self.master_provider.model_id, local=True)
                 response = await asyncio.wait_for(self.master_provider.generate(prompt), self.total_timeout_seconds)
                 parsed = json.loads(response.content)
                 if isinstance(parsed, dict):

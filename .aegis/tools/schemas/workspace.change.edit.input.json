@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["path", "find", "replace"],
+  "properties": {
+    "path": {"type": "string", "minLength": 1},
+    "find": {"type": "string", "minLength": 1},
+    "replace": {"type": "string"},
+    "expected_matches": {"type": "integer", "minimum": 1, "maximum": 20, "default": 1},
+    "dry_run": {"type": "boolean", "default": false}
+  }
+}

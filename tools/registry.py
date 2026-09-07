@@ -39,6 +39,29 @@ class ToolMeta(BaseModel):
     reversible: bool = True
     idempotent: bool = True
     offline_capable: bool = True
+    version: str = "1.0.0"
+    namespace: str = "workspace"
+    output_schema: dict[str, Any] = Field(default_factory=dict)
+    mutation: str = "read_only"
+    supports_dry_run: bool = False
+    max_output_bytes: int = 20_000
+    workspace_scoped: bool = True
+    audit_event: str = "tool.invoked"
+
+
+class ToolContract(BaseModel):
+    """Validation-facing contract exposed to planners and reviewers."""
+    name: str
+    input_schema: dict[str, Any] = Field(default_factory=dict)
+    permission_requirements: dict[str, bool] = Field(default_factory=dict)
+    workspace_policy: str = "workspace_confined"
+    expected_output: str = "structured tool result"
+    failure_types: list[str] = Field(default_factory=list)
+    verification_method: str = "read tool result and exit status"
+    version: str = "1.0.0"
+    mutation: str = "read_only"
+    requires_approval: bool = False
+    supports_dry_run: bool = False
 
 
 class ToolRegistry:
@@ -70,6 +93,19 @@ class ToolRegistry:
         """Register a LangChain tool with metadata."""
         name = tool.name
         self._tools[name] = tool
+        mutation = "destructive" if permissions and permissions.get("delete") else (
+            "reversible" if permissions and permissions.get("write") else "read_only")
+        namespace = "workspace"
+        if name in {"execute_command"}:
+            namespace = "workspace.run"
+        elif name in {"edit_file", "create_file", "create_python_script", "restore_checkpoint"}:
+            namespace = "workspace.change"
+        elif name in {"create_checkpoint", "list_checkpoints", "workspace_diff"}:
+            namespace = "workspace.checkpoint"
+        elif name in {"git_status", "git_diff"}:
+            namespace = "workspace.verify"
+        elif name in {"read_file", "tree", "list_directory", "search_files", "find_files", "get_file_info", "repository_context"}:
+            namespace = "workspace.read"
         self._meta[name] = ToolMeta(
             name=name,
             description=tool.description or "",
@@ -82,6 +118,8 @@ class ToolRegistry:
                                         "network": False, "external_side_effect": False,
                                         "credential_access": False, "system_access": False},
             reversible=reversible, idempotent=idempotent, offline_capable=offline_capable,
+            namespace=namespace, mutation=mutation, supports_dry_run=name in {"edit_file", "create_file"},
+            audit_event=f"{namespace}.{name}",
         )
 
     def get(self, name: str) -> BaseTool:
@@ -91,6 +129,27 @@ class ToolRegistry:
 
     def get_meta(self, name: str) -> ToolMeta:
         return self._meta[name]
+
+    def get_contract(self, name: str) -> ToolContract:
+        tool = self.get(name)
+        meta = self.get_meta(name)
+        schema: dict[str, Any] = {}
+        args_schema = getattr(tool, "args_schema", None)
+        if args_schema is not None and hasattr(args_schema, "model_json_schema"):
+            schema = args_schema.model_json_schema()
+        return ToolContract(
+            name=name, input_schema=schema,
+            permission_requirements=dict(meta.permissions),
+            expected_output=f"result from {name}",
+            failure_types=["COMMAND_FAILURE", "TIMEOUT", "PERMISSION_ERROR", "PATH_ERROR"],
+            version=meta.version, mutation=meta.mutation,
+            requires_approval=meta.requires_approval,
+            supports_dry_run=meta.supports_dry_run,
+        )
+
+    def contracts(self, names: list[str] | None = None) -> list[ToolContract]:
+        selected = names if names is not None else self.list_names()
+        return [self.get_contract(name) for name in selected if name in self._tools]
 
     def list_tools(self) -> list[BaseTool]:
         """Return all registered LangChain tools."""

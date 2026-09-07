@@ -26,3 +26,10 @@ def test_document_artifact_requests_use_semantic_document_capability():
     plan = MasterAgent(None)._capability_plan("create txt file about agentic AI")
     assert plan[0]["agent"] == "document_agent"
     assert plan[0]["capability"] == "document_creation"
+
+
+def test_python_file_request_about_rb_tree_routes_to_coding():
+    from runtime.agents import MasterAgent
+    plan = MasterAgent(None)._capability_plan("create py file about rb trees")
+    assert plan[0]["agent"] == "coding_agent"
+    assert plan[0]["capability"] == "code_debugging"

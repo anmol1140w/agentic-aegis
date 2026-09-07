@@ -85,7 +85,7 @@ class Orchestrator:
         self._session_task_type: dict[str, str] = {}   # NEW: thread_id -> last task_type
         self._approval_fn = None  # injectable for tests; None → interactive CLI
         self.filesystem = FilesystemTools(
-            SessionPermissions([Path.cwd(), self.output_store.workspace_dir]),
+            SessionPermissions([self.workspace_root]),
             requester=self._request_filesystem_permission,
         )
         self.workspace_tools = WorkspaceReadTools(
@@ -133,7 +133,16 @@ class Orchestrator:
             master_provider = registry.get_provider("qwen-general")
         except KeyError:
             master_provider = None
-        self.master_agent = MasterAgent(self.agent_registry, master_provider=master_provider)
+        self.master_agent = MasterAgent(
+            self.agent_registry,
+            master_provider=master_provider,
+        )
+        self.master_agent.model_call_callback = self.network.record_model_call
+        for specialist in self.agent_registry._agents.values():
+            if hasattr(specialist, "model_call_callback"):
+                specialist.model_call_callback = self.network.record_model_call
+            if hasattr(specialist, "tool_call_callback"):
+                specialist.tool_call_callback = self.network.record_tool_call
         self.graph = self._build_graph()
 
     @staticmethod
@@ -176,17 +185,30 @@ class Orchestrator:
         run_id = self.output_store.new_run_id()
         result_items = graph_state.get("step_results", [])
         status = "success" if graph_state.get("status") == "completed" else "failure"
+        selected_model_role = graph_state.get("selected_model", "")
+        selected_model_id = ""
+        if selected_model_role:
+            try:
+                selected_model_id = self.registry.get_provider(selected_model_role).model_id
+            except (KeyError, AttributeError):
+                selected_model_id = str(selected_model_role)
+        network_report = self.network.report()
         metadata = {
             "run_id": run_id, "execution_mode": "master", "status": status,
-            "task_type": "master", "modality": "text", "model": "qwen3.5:9b",
+            "task_type": "master", "modality": "text", "model": selected_model_id,
+            "model_role": selected_model_role,
             "started_at": datetime.now(timezone.utc).isoformat(),
             "completed_at": datetime.now(timezone.utc).isoformat(),
         }
         trace = [{"timestamp": datetime.now(timezone.utc).isoformat(), "step": e.get("event", "master"),
                   "message": e.get("event", "master"), "metadata": e} for e in graph_state.get("trace", [])]
+        trace.append(make_trace_dict("network_status", "Network snapshot recorded", metadata=network_report))
         trace.append(make_trace_dict("master_persist", "Master result persisted", metadata={"run_id": run_id}))
         final_answer = graph_state.get("final_answer", "")
         output_dir = self.output_store.save_run(run_id=run_id, result=final_answer, metadata=metadata, trace=trace)
+        (output_dir / "network_report.json").write_text(
+            json.dumps(network_report, indent=2) + "\n", encoding="utf-8"
+        )
         result = {
             "run_id": run_id,
             "output_dir": str(output_dir),
@@ -201,6 +223,7 @@ class Orchestrator:
             "repair_history": graph_state.get("repair_history", []),
             "selected_agent": graph_state.get("selected_agent", ""),
             "selected_model": graph_state.get("selected_model", ""),
+            "network_report": network_report,
             "trace": trace,
         }
         return result
@@ -415,7 +438,7 @@ class Orchestrator:
                 "current_step": "error",
             }
 
-        self.network.record_tool_call()
+        self.network.record_tool_call(tool=tool_name, local=True)
 
         try:
             if tool_name == "read_file":
@@ -507,8 +530,8 @@ class Orchestrator:
                 messages=graph_messages,
                 encoded_images=encoded_images or [],
                 max_iterations=self.max_iterations,
-                on_model_call=self.network.record_model_call,
-                on_tool_call=self.network.record_tool_call,
+                on_model_call=lambda: self.network.record_model_call(model=provider.model_id, local=True),
+                on_tool_call=lambda: self.network.record_tool_call(tool="coding_graph", local=True),
             )
         except Exception as exc:
             yield {"kind": "error", "message": f"Coding graph error: {exc}"}
@@ -554,7 +577,7 @@ class Orchestrator:
                 results.append({"ok": False, "tool": name, "error": "InvalidArguments"})
                 continue
             try:
-                self.network.record_tool_call()
+                self.network.record_tool_call(tool=name, local=True)
                 output = await self.tool_registry.get(name).ainvoke(args)
                 results.append({"ok": True, "tool": name, "result": output})
             except Exception as exc:
@@ -583,7 +606,7 @@ class Orchestrator:
             )
         ]
 
-        self.network.record_model_call()
+        self.network.record_model_call(model=provider.model_id, local=True)
 
         try:
             image_t0 = time.perf_counter()
@@ -679,17 +702,7 @@ class Orchestrator:
             "started_at": started_at, "completed_at": datetime.now(timezone.utc).isoformat(),
             "latency_ms": state.get("total_ms"),
         }
-        network = self.network.snapshot()
-        network_report = {
-            "external_connection_count": network.external_connections,
-            "denied_attempts": [],
-            "local_connections": network.local_connections,
-            "agent_local_connections": network.agent_local_connection_details,
-            "agent_external_connections": network.agent_external_connection_details,
-            "observed_external_connection_count": network.observed_external_connections,
-            "local_model_calls": network.local_model_calls,
-            "local_tool_calls": network.local_tool_calls,
-        }
+        network_report = self.network.report()
         trace = list(state.get("trace", []))
         trace.append(make_trace_dict("network_status", "Network snapshot recorded", metadata=network_report))
         trace.append(make_trace_dict("persist_output", "Output persisted", metadata={"run_id": run_id}))
@@ -811,7 +824,7 @@ class Orchestrator:
 
             first_token_ms: float | None = None
             response_parts: list[str] = []
-            self.network.record_model_call()
+            self.network.record_model_call(model=provider.model_id, local=True)
             stream_method = getattr(provider, "stream_chat_events", None)
             stream = stream_method(self._provider_messages(messages), encoded_images=encoded_images,
                                    think=os.getenv("SHOW_OLLAMA_THINKING", "0") == "1") if stream_method else provider.stream_chat(

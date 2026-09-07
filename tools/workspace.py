@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import fnmatch
 import ast
+import json
 import os
 import shlex
 import subprocess
@@ -11,6 +12,7 @@ import signal
 import sys
 import time
 import threading
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -20,8 +22,10 @@ from runtime.command_policy import evaluate_command
 from runtime.capability_policy import CommandCapability, classify_command
 from tools.container_sandbox import ContainerSandbox
 from tools.bwrap_sandbox import BubblewrapSandbox
+from tools import native_process
 from storage.checkpoints import WorkspaceCheckpointStore
 from runtime.skills import SkillCatalog
+from tools.runtime import ToolRuntime
 
 _MAX_ITEMS = 200
 _MAX_FILE_BYTES = 64 * 1024
@@ -37,6 +41,9 @@ class WorkspaceReadTools:
 
     def __init__(self, root: str | Path = "workspace", approver: Any = None, command_approver: Any = None) -> None:
         self.root = Path(root).resolve()
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.execution_dir = self.root / "executions"
+        self.artifact_dir = self.root / "artifacts"
         self.approver = approver
         self.command_approver = command_approver or approver
         self.command_event_callback: Any = None
@@ -45,6 +52,16 @@ class WorkspaceReadTools:
         self.bwrap_sandbox = BubblewrapSandbox(self.root) if self.sandbox_backend in {"bwrap", "bubblewrap"} else None
         self.checkpoints = WorkspaceCheckpointStore(self.root)
         self.skills = SkillCatalog([self.root / "skills", self.root / ".aegis" / "skills"])
+        self.runtime = ToolRuntime(self)
+
+    def tool_catalog(self) -> list[dict[str, Any]]:
+        """Return the compact namespaced catalog for progressive disclosure."""
+        return self.runtime.catalog()
+
+    def invoke_tool(self, name: str, arguments: dict[str, Any] | None = None,
+                    *, request_id: str | None = None) -> dict[str, Any]:
+        """Invoke a canonical tool through the single policy/result boundary."""
+        return self.runtime.invoke(name, arguments, request_id=request_id)
 
     def _path(self, raw: str | Path) -> Path | dict[str, Any]:
         raw_path = Path(raw)
@@ -258,6 +275,8 @@ class WorkspaceReadTools:
         old_text: str,
         new_text: str,
         approver: Any = None,
+        expected_matches: int = 1,
+        dry_run: bool = False,
     ) -> dict[str, Any]:
         """Atomically edit a file in the workspace by replacing single exact old_text with new_text.
 
@@ -390,30 +409,32 @@ class WorkspaceReadTools:
 
         # Validate old_text matches exactly once
         count = content.count(old_text)
-        if count == 0:
+        if count != expected_matches:
+            error = ("old_text_not_found" if expected_matches == 1 and count == 0
+                     else "old_text_ambiguous" if expected_matches == 1 and count > 1
+                     else "invalid_input")
             return {
                 "ok": False,
                 "status": "failure",
                 "tool": "edit_file",
-                "error": "old_text_not_found",
-                "message": "old_text was not found in the file.",
+                "error": error,
+                "message": f"Expected {expected_matches} matches, found {count}.",
                 "path": rel_str,
             }
-        if count > 1:
-            return {
-                "ok": False,
-                "status": "failure",
-                "tool": "edit_file",
-                "error": "old_text_ambiguous",
-                "message": f"old_text matched {count} times, expected exactly 1.",
-                "path": rel_str,
-            }
-
         # Approval gate
         active_approver = approver if approver is not None else getattr(self, "approver", None)
         approved = False
         if active_approver is not None:
             approved = self._check_approval(active_approver, rel_str, old_text, new_text)
+
+        new_content = content.replace(old_text, new_text, expected_matches)
+        import difflib
+        diff = "".join(difflib.unified_diff(content.splitlines(True), new_content.splitlines(True),
+                                             fromfile=rel_str, tofile=rel_str))[:_MAX_FILE_BYTES]
+        if dry_run:
+            return {"ok": True, "status": "success", "tool": "edit_file", "path": rel_str,
+                    "changed": new_content != content, "matches": count, "diff": diff,
+                    "dry_run": True}
 
         if not approved:
             return {
@@ -428,7 +449,7 @@ class WorkspaceReadTools:
         # Atomic replace
         import tempfile
         bytes_before = len(content.encode("utf-8"))
-        new_content = content.replace(old_text, new_text, 1)
+        new_content = content.replace(old_text, new_text, expected_matches)
         bytes_after = len(new_content.encode("utf-8"))
 
         try:
@@ -468,9 +489,12 @@ class WorkspaceReadTools:
             "changed": True,
             "bytes_before": bytes_before,
             "bytes_after": bytes_after,
+            "matches": count,
+            "diff": diff,
         }
 
-    def create_file(self, path: str, content: str, approver: Any = None) -> dict[str, Any]:
+    def create_file(self, path: str, content: str, approver: Any = None,
+                    dry_run: bool = False) -> dict[str, Any]:
         """Create a new text file inside the workspace (requires approval)."""
         target = self._path(path)
         if isinstance(target, dict):
@@ -479,6 +503,9 @@ class WorkspaceReadTools:
             return {"ok": False, "status": "failure", "tool": "create_file", "error": "file_exists"}
         if not isinstance(content, str) or len(content.encode("utf-8")) > _MAX_FILE_BYTES:
             return {"ok": False, "status": "failure", "tool": "create_file", "error": "content_too_large"}
+        if dry_run:
+            return {"ok": True, "status": "success", "tool": "create_file", "path": str(target),
+                    "bytes": len(content.encode("utf-8")), "dry_run": True, "changed": not target.exists()}
         active = approver if approver is not None else self.approver
         approved = self._check_create_approval(active, path, content) if active else False
         if not approved:
@@ -486,8 +513,18 @@ class WorkspaceReadTools:
         try:
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(content, encoding="utf-8")
-            return {"ok": True, "status": "success", "tool": "create_file", "path": str(target),
-                    "bytes": target.stat().st_size}
+            result = {"ok": True, "status": "success", "tool": "create_file", "path": str(target),
+                      "bytes": target.stat().st_size}
+            # Files deliberately created under artifacts/ receive provenance
+            # immediately, so the directory is a usable artifact catalog and
+            # not just an output bucket.
+            if target.is_relative_to(self.artifact_dir) and target.name != "artifacts.json":
+                from storage.artifacts import ArtifactManager
+                result["artifact"] = ArtifactManager(self.artifact_dir).register_artifact(
+                    target, artifact_type="file", tool_id="create_file",
+                    verification_status="verified",
+                )
+            return result
         except OSError as exc:
             return {"ok": False, "status": "failure", "tool": "create_file", "error": str(exc)[:200]}
 
@@ -672,10 +709,17 @@ class WorkspaceReadTools:
         t0 = time.perf_counter()
         timed_out = False
         try:
+            native_result = native_process.run(tokens, cwd=target_cwd, env=env, timeout=safe_timeout)
+            if native_result is not None:
+                duration_ms = round((time.perf_counter() - t0) * 1000, 2)
+                stdout = native_result["stdout"]
+                stderr = native_result["stderr"]
+                exit_code = native_result["returncode"]
+                timed_out = bool(native_result.get("timed_out"))
             # Production commands run in a fresh process group so a timeout
             # can terminate the complete child tree. The subprocess.run branch
             # keeps existing dependency-injection tests compatible.
-            if getattr(subprocess.run, "__module__", "subprocess") != "subprocess":
+            elif getattr(subprocess.run, "__module__", "subprocess") != "subprocess":
                 proc = subprocess.run(tokens, cwd=str(target_cwd), env=env,
                                       capture_output=True, text=True,
                                       timeout=safe_timeout, check=False)
@@ -794,7 +838,35 @@ class WorkspaceReadTools:
         }
         if decision.requires_approval:
             res["approval"] = "approved"
+        res.update(self._record_execution(command, target_cwd, res))
         return res
+
+    def _record_execution(self, command: str, cwd: Path, result: dict[str, Any]) -> dict[str, Any]:
+        """Persist bounded, non-secret execution evidence inside executions/."""
+        execution_id = f"exec_{uuid.uuid4().hex[:12]}"
+        try:
+            relative_cwd = str(cwd.relative_to(self.root)) or "."
+        except ValueError:
+            relative_cwd = "."
+        record = {
+            "execution_id": execution_id,
+            "command": command,
+            "cwd": relative_cwd,
+            "status": result.get("status", "unknown"),
+            "exit_code": result.get("exit_code"),
+            "duration_ms": result.get("duration_ms", 0),
+            "timed_out": bool(result.get("timed_out", False)),
+            "stdout": str(result.get("stdout", ""))[-4000:],
+            "stderr": str(result.get("stderr", ""))[-4000:],
+            "recorded_at": datetime.now(timezone.utc).isoformat(),
+        }
+        self.execution_dir.mkdir(parents=True, exist_ok=True)
+        target = self.execution_dir / f"{execution_id}.json"
+        try:
+            target.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+        except OSError:
+            return {"execution_id": execution_id, "execution_record": None}
+        return {"execution_id": execution_id, "execution_record": str(target.relative_to(self.root))}
 
     def sandbox_status(self) -> dict[str, Any]:
         """Check the local command sandbox before any user command runs.

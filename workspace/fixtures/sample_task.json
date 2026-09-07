@@ -1,0 +1,6 @@
+{
+  "task": "add a health-check function",
+  "language": "python",
+  "expected_files": ["sample_module.py", "test_sample_module.py"],
+  "verification": "pytest -q"
+}

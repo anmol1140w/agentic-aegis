@@ -1,116 +1,42 @@
-# AEGIS — complete system summary
+# AEGIS current system summary
 
-AEGIS is a local-first, Master-first agent workbench for secure coding,
-document, vision, and artifact workflows. It runs through local Ollama models,
-keeps workspace data local, and requires deterministic evidence before it
-reports success.
+AEGIS is a local-first, Master-first workbench for coding, documents, vision,
+and verified artifacts. It uses local Ollama inference and does not use cloud
+fallbacks in the normal path.
 
-## Runtime flow
+## Current flow
 
 ```text
-User / CLI / API
-  → NLP preprocessing
-  → MasterAgent
-  → capability registry and semantic matching
-  → universal LangGraph task graph
-  → specialist agent
-  → policy / approval
-  → bounded tools and local pipelines
-  → structured AgentResult
-  → verify_plan
-  → review, bounded repair, or safe failure
-  → final response and audit output
+request → NLP → Master plan → specialist → typed tools
+        → policy/approval → observation → verification → review → evidence
 ```
 
-The universal graph nodes are `normalize_request`,
-`classify_and_route`, `create_plan`, `validate_plan`, `execute_step`,
-`record_step_result`, `verify_plan`, `self_heal`, `review_and_finish`, and
-`safe_failure`. Coding has an additional bounded tool loop for inspect → edit
-→ test → readback → repair behavior.
+The final response is derived from structured state, not from an unverified
+model claim. A successful mutation must have changed-file evidence, read-back,
+syntax/static checks where applicable, successful command evidence when
+requested, a reviewer result, and a checkpoint or explicit safe path.
 
-## Agents and models
+## Local roles and model aliases
 
-| Agent | Local model | Responsibility |
+| Role | Config alias | Default model |
 |---|---|---|
-| `master_agent` | `qwen3.5:9b` | intent, capability selection, delegation, review, repair |
-| `coding_agent` | `qwen2.5-coder:7b` | source inspection, approved edits, commands, tests |
-| `document_agent` | `qwen3.5:9b` | PDF/TXT/Markdown/DOCX creation and document analysis |
-| `vision_agent` | `qwen3-vl:8b` | local image/P&ID analysis and structured observations |
-| `lightweight_agent` | `llama3.2:1b` | simple local/general requests |
+| Master/general/document | `qwen-general` | `qwen3.5:9b` |
+| Coding | `qwen-coder` | `qwen2.5-coder:7b` |
+| Vision | `qwen-vision` | `qwen3-vl:8b` |
+| Lightweight capability profile | `llama-small` | configured locally; not an initial handoff |
 
-Agent discovery is registry-based and capability-aware. Semantic matching can
-rank equivalent descriptions, while artifact, modality, availability, and
-policy constraints remain authoritative.
+Change model tags only in `config/models.yaml`.
 
-## Tools and artifacts
+## Workspace products
 
-Implemented local capabilities include workspace listing/search/read, guarded
-file creation/editing, Python script creation, command execution, test runs,
-Git status/diff, document discovery/extraction/search, OCR/PDF processing,
-vision preprocessing/inference, artifact creation/verification, calculator,
-and structured audit output. The native MCP adapter exposes the same registry
-without creating another executor.
+`workspace/fixtures` contains reusable offline examples, `workspace/agent_test`
+contains agent contract tests, `workspace/artifacts` stores verified reusable
+files with provenance, and `workspace/executions` stores bounded command
+records. Per-run result and trace files are generated under
+`workspace/outputs/<run_id>/`.
 
-Generated artifacts are workspace-bounded, reopened after writing, and checked
-for existence, readability, format validity, non-empty content, and relevant
-verification metadata.
+## Explicit non-goals
 
-## Security model
-
-- Workspace and symlink confinement.
-- Central command policy and bounded subprocess execution.
-- Process-group termination on timeout.
-- Output-size and time limits.
-- Approval for file mutations and sensitive commands.
-- Network disabled by default.
-- Git mutation, deletion, arbitrary shell, credential access, and cloud APIs
-  are not enabled by default.
-- Visual content is treated as untrusted data.
-- Computer-use is disabled until its dedicated security controls and tests are
-  implemented.
-- Private chain-of-thought is never exposed or persisted; only operational
-  events and bounded evidence are recorded.
-
-## Terminal experience
-
-Run:
-
-```bash
-source .venv/bin/activate
-python cli.py
-```
-
-The terminal now provides an AEGIS dashboard with model health, session ID,
-Master-first/LangGraph state, live phase updates, approval prompts, response
-panels, verification status, repair counts, and output locations.
-
-Interactive commands:
-
-```text
-/help      command list
-/models    local model health
-/network   network and tool counters
-/status    AEGIS security/runtime status
-/clear     redraw terminal dashboard
-/quit      exit
-```
-
-Run the API with:
-
-```bash
-uvicorn app.api.main:app --host 127.0.0.1 --port 8000
-```
-
-Endpoints are documented in `docs/aegis-api.md`; the service uses the same
-`Orchestrator.run_master` path as the terminal.
-
-## Validation status
-
-The repository regression suite currently passes with 317 tests and one
-intentional skip. The local Qwen-VL acceptance path reaches Ollama with a
-validated image payload and returns a structured failure when the installed
-local model produces no usable response. AEGIS does not convert that condition
-into a false success.
-
-RAG, cloud inference, unrestricted computer-use, and external MCP transport
-remain intentionally deferred.
+Cloud inference, unrestricted shell, network tools, Git mutation, delete tools,
+desktop control, embeddings/vector retrieval, and silent completion claims are
+not enabled by the current architecture.

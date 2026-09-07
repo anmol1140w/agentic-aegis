@@ -1,0 +1,11 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["command"],
+  "properties": {
+    "command": {"type": "string", "minLength": 1, "maxLength": 4000},
+    "cwd": {"type": "string", "default": "."},
+    "timeout": {"type": "integer", "minimum": 1, "maximum": 120, "default": 90}
+  }
+}

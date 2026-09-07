@@ -213,6 +213,72 @@ async def test_coding_agent_allows_new_file_creation_without_initial_read(tmp_pa
 
 
 @pytest.mark.asyncio
+async def test_creation_request_rejects_invented_paths_and_converges(tmp_path) -> None:
+    """A new-file task must not burn retries on guessed task directories."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    calls: list[str] = []
+    provider = MagicMock()
+    provider.generate = AsyncMock(side_effect=[
+        MagicMock(content='{"action":"read_file","arguments":{"path":"task_directory/new.py"}}'),
+        MagicMock(content='{"action":"create_file","arguments":{"path":"avl_tree.py","content":"class AVLTree:\\n    pass\\n"}}'),
+        MagicMock(content='{"action":"final","answer":"Created and verified avl_tree.py."}'),
+    ])
+
+    def read_file(path):
+        calls.append(f"read:{path}")
+        return {"ok": True, "content": "class AVLTree:\n    pass\n", "path": path}
+
+    def create_file(path, content):
+        calls.append(f"create:{path}")
+        (tmp_path / path).write_text(content, encoding="utf-8")
+        return {"ok": True, "status": "success", "path": path}
+
+    agent = OllamaSpecialistAgent(
+        AgentDescriptor(name="coding_agent", role="coding", capabilities=[AgentCapability.CODING],
+                        provider_name="stub", allowed_tools=["read_file", "create_file"]),
+        provider, tools={"read_file": read_file, "create_file": create_file},
+    )
+    result = await agent.run(AgentRequest(task="create a Python file about AVL trees"))
+
+    assert result.status == AgentStatus.SUCCESS
+    assert calls == ["create:avl_tree.py", "read:avl_tree.py"]
+
+
+@pytest.mark.asyncio
+async def test_repeated_create_after_success_stops_without_filesystem_loop(tmp_path) -> None:
+    from unittest.mock import AsyncMock, MagicMock
+
+    calls: list[str] = []
+    provider = MagicMock()
+    provider.generate = AsyncMock(side_effect=[
+        MagicMock(content='{"action":"create_python_script","arguments":{"path":"rb_tree.py","content":"class RBTree:\\n    pass\\n"}}'),
+        MagicMock(content='{"action":"create_python_script","arguments":{"path":"rb_tree.py","content":"class RBTree:\\n    pass\\n"}}'),
+    ])
+
+    def read_file(path):
+        calls.append(f"read:{path}")
+        return {"ok": True, "content": "class RBTree:\n    pass\n", "path": path}
+
+    def create_python_script(path, content):
+        calls.append(f"create:{path}")
+        target = tmp_path / path
+        if target.exists():
+            return {"ok": False, "status": "failure", "error": "file_exists", "path": path}
+        target.write_text(content, encoding="utf-8")
+        return {"ok": True, "status": "success", "path": path}
+
+    agent = OllamaSpecialistAgent(
+        AgentDescriptor(name="coding_agent", role="coding", capabilities=[AgentCapability.CODING],
+                        provider_name="stub", allowed_tools=["read_file", "create_python_script"]),
+        provider, tools={"read_file": read_file, "create_python_script": create_python_script},
+    )
+    result = await agent.run(AgentRequest(task="create py file about rb trees"))
+    assert result.status == AgentStatus.SUCCESS
+    assert calls == ["create:rb_tree.py", "read:rb_tree.py"]
+
+
+@pytest.mark.asyncio
 async def test_coding_agent_must_run_requested_file_before_finalizing(tmp_path) -> None:
     """A premature model final cannot skip the user's explicit run request."""
     from unittest.mock import AsyncMock, MagicMock

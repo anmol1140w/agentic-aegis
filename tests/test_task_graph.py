@@ -100,6 +100,16 @@ async def test_universal_graph_has_bounded_structured_repair():
 
 
 @pytest.mark.asyncio
+async def test_universal_graph_does_not_retry_policy_denial():
+    result = AgentResult(agent="document_agent", status=AgentStatus.FAILURE,
+                         summary="denied", errors=["approval_denied"])
+    state = await run_task_graph(_Master(result), "create pdf about AEGIS", workspace_root=".", max_task_retries=3)
+    assert state["status"] == "failed"
+    assert state["repair_history"] == []
+    assert any(item.get("error_code") == "approval_denied" for item in state["errors"])
+
+
+@pytest.mark.asyncio
 async def test_graph_repair_reuses_specialist_working_memory():
     master = _RepairMaster()
     state = await run_task_graph(master, "fix the failing test", workspace_root=".", max_task_retries=1)

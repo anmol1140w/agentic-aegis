@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": ["ok", "tool", "operation", "request_id"],
+  "properties": {
+    "ok": {"type": "boolean"},
+    "tool": {"const": "workspace.change.edit"},
+    "operation": {"type": "string"},
+    "request_id": {"type": "string"},
+    "data": {"type": "object"},
+    "error": {"type": ["object", "null"]}
+  }
+}

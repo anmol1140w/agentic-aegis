@@ -61,8 +61,9 @@ def coding_execution_requirements(task: str) -> dict[str, bool]:
     ))
     test_task = bool(re.search(r"\b(pytest|test|tests|testing|test-suite|unittest|compile|compil(?:e|ation))\b", text))
     execution_task = bool(re.search(r"\b(run|execute|verify|build|compile|debug|debugging|fix|repair|implement)\b", text))
+    inspection_task = bool(re.search(r"\b(inspect|find|search|list|summarize|structure|unsafe|regex|pattern|inventory|analy[sz]e)\b", text))
     return {"coding": coding, "requires_command": coding and (test_task or execution_task),
-            "requires_test_command": test_task}
+            "requires_test_command": test_task, "requires_inspection": inspection_task}
 
 
 def verify_coding_result(result: dict[str, Any], task: str) -> dict[str, Any]:
@@ -71,6 +72,7 @@ def verify_coding_result(result: dict[str, Any], task: str) -> dict[str, Any]:
     metadata = result.get("metadata") if isinstance(result.get("metadata"), dict) else {}
     state = metadata.get("coding_state") if isinstance(metadata.get("coding_state"), dict) else {}
     commands = state.get("commands") if isinstance(state.get("commands"), list) else []
+    evidence_items = [str(item) for item in state.get("evidence", [])] if isinstance(state.get("evidence"), list) else []
     successful = [item for item in commands if isinstance(item, dict) and item.get("exit_code") == 0 and not item.get("timed_out")]
     test_commands = [item for item in successful if re.search(r"\b(pytest|unittest|cargo\s+test|go\s+test|npm\s+test|make\s+test)\b", str(item.get("command", "")), re.I)]
     evidence = [{"kind": "execute_command", "passed": bool(successful), "source": "coding_state",
@@ -84,6 +86,11 @@ def verify_coding_result(result: dict[str, Any], task: str) -> dict[str, Any]:
         last_edit = int(state.get("last_edit_state_version", -1) or -1)
         if last_edit >= 0 and not any(int(item.get("state_version", -1)) >= last_edit for item in test_commands):
             missing.append("test command executed after the resulting edit")
+    if requirements.get("requires_inspection"):
+        inspected = any(item.startswith(("repository_context:", "read_file:", "search_files:", "find_files:", "tree:"))
+                         for item in evidence_items)
+        if not inspected:
+            missing.append("actual repository inspection evidence")
     if requirements["requires_command"] and state.get("verification", {}).get("status") not in {"passed", "verified"}:
         missing.append("deterministic verification state")
     if result.get("status") not in {"success", "succeeded"}:

@@ -1,70 +1,47 @@
-# AEGIS Workflows — Current Status
+# AEGIS workflows — current version
 
-All normal CLI requests and API tasks enter the same MasterAgent workflow.
-NLP preprocessing preserves the original request and supplies normalized
-context. Master capability discovery uses registry metadata and semantic
-matching, then delegates to one least-privileged specialist.
+## Master workflow
 
-```text
-request → NLP → MASTER_PLAN → CAPABILITY_DISCOVERY → DELEGATE
-→ specialist/tool execution → structured AgentResult → REVIEW
-→ VERIFY or bounded REPLAN → FINAL + trace/artifacts
-```
-
-Reads are automatic. Edits and approved test commands require terminal
-approval; workspace escapes, network access, deletes, arbitrary shell, and Git
-mutation are denied. Specialist failures become structured failures or
-capability-compatible retries; there is no universal coding fallback.
-
----
-
-## 1. Master Workflow (authoritative)
-
-When a user initiates an interaction via `cli.py` or the API, the orchestrator executes the Master pipeline above. The older classifier/router graph is retained only as compatibility infrastructure and is not the normal execution path.
+All normal CLI and API requests use this sequence:
 
 ```text
-User/OCR → NLP → MasterAgent → AgentRegistry → specialist
-→ Policy → tools/pipelines → AgentResult → Master review → final
+normalize → inspect repository → classify capability → create bounded plan
+→ validate plan → delegate one step → observe result → verify
+→ review → bounded repair or final evidence
 ```
 
----
+The master does not expose privileged mutation tools directly. Specialists get
+only their allowlisted tools. The lightweight model is not a first-stage
+terminal specialist; the master owns the route and review.
 
-## 2. Multi-Step Workflows (Roadmap & Progressive Integration)
+## Coding workflow
 
-### Workflow 1: Flagship Inspection & Approval Note (Phases 3-5)
 ```text
-Inspection Report (PDF)
-         │
-         ▼
-[Document Pipeline] ──▶ Detect Native vs Scanned
-         │
-         ▼
-[OCR / PP-StructureV3] ──▶ Extract structured findings, tables, defect logs
-         │
-         ▼
-[Reasoning Model] ──▶ Synthesize technical recommendation & risk level
-         │
-         ▼
-[HITL Approval] ──▶ Operator reviews findings & draft approval note
-         │
-         ▼
-[Artifact Generator] ──▶ Generates signed inspection_approval_note.docx
-         │
-         ▼
-[Artifact Store] ──▶ Records metadata, SHA256 checksum, and file size
+repository_context/tree/search
+→ read relevant source
+→ checkpoint
+→ approval
+→ one minimal edit/create
+→ mandatory read-back
+→ syntax/static validation
+→ targeted command/test
+→ diff and independent review
 ```
 
-### Workflow 2: Code Generation with Sandbox Verification (Phases 2-5)
-```text
-Coding Request
-      │
-      ▼
-[Coding Model] ──▶ Generates Python code & unit tests
-      │
-      ▼
-[Docker Sandbox] ──▶ Executes in ephemeral container (network disabled)
-      │
-      ├── If tests fail ──▶ Feed error back to Coding Model for self-repair
-      │
-      └── If tests pass ──▶ Return verified code & test execution proof
-```
+Failures are classified into bounded categories. Repair is limited, does not
+retry policy or security failures, and never edits a test merely to hide an
+implementation failure.
+
+## Document and vision workflows
+
+Document and image paths are resolved under `./workspace`. Text extraction,
+OCR, PDF/DOCX/PPTX inspection, and image preprocessing are local and bounded.
+Visual or repository content is data, not authority; instructions found inside
+files cannot approve tools or expand permissions.
+
+## Outputs and evidence
+
+Each run writes `result.txt`, `metadata.json`, `trace.json`, and when applicable
+`network_report.json` under `workspace/outputs/<run_id>/`. Commands also write a
+bounded record under `workspace/executions/`. Artifacts created under
+`workspace/artifacts/` receive provenance and SHA-256 registration.

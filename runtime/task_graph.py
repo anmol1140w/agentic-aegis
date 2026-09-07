@@ -18,6 +18,11 @@ from runtime.nlp import NLPPreprocessor
 from runtime.self_healing import classify_failure, normalize_repair_action
 from runtime.task_state import TaskRunState, TaskStatus, StepStatus
 from runtime.verification import verify_coding_result, verify_plan
+from runtime.repository_index import RepositoryIndex
+from runtime.context_manager import ContextBudgetManager
+from runtime.model_profiles import get_model_profile
+from runtime.reviewer import deterministic_review
+from runtime.prompts import handoff_prompt
 
 
 def _emit(callback: Callable[[dict[str, Any]], None] | None, event: str, **data: Any) -> dict[str, Any]:
@@ -56,9 +61,19 @@ def build_task_graph(master: MasterAgent, *, workspace_root: str,
         supplied = (request_context or {}).get("task_spec")
         if isinstance(supplied, dict):
             spec.update(supplied)
+        repository_map: dict[str, Any] = {}
+        try:
+            index = RepositoryIndex(workspace_root)
+            index.refresh()
+            repository_map = index.summary()
+        except Exception as exc:
+            repository_map = {"root": workspace_root, "index_error": str(exc)}
         return {"normalized_request": nlp.enhanced_prompt,
                 "preprocessing": nlp.to_dict(),
                 "task": spec,
+                "repository_root": workspace_root,
+                "repository_map": repository_map,
+                "facts": [f"repository root: {workspace_root}"],
                 "status": TaskStatus.PENDING.value,
                 "trace": [_emit(progress_callback, "preprocessing_completed",
                                   normalization_count=nlp.metadata.get("normalization_count", 0),
@@ -66,12 +81,21 @@ def build_task_graph(master: MasterAgent, *, workspace_root: str,
 
     async def classify_and_route(state: TaskRunState) -> dict[str, Any]:
         request = state["normalized_request"] or state["original_request"]
-        planned = master._capability_plan(request)
+        if hasattr(master, "route_request"):
+            planned = await master.route_request(request, context=request_context or {})
+        else:
+            planned = master._capability_plan(request)
         if not planned:
             return {"status": TaskStatus.FAILED.value,
                     "errors": [{"code": "no_capability", "message": "No suitable capability found."}],
                     "trace": [_emit(progress_callback, "capability_discovery_failed")]}
         item = planned[0]
+        relevant_files: list[str] = []
+        try:
+            index = RepositoryIndex(workspace_root)
+            relevant_files = index.relevant_files(request)
+        except Exception:
+            pass
         agent_name = str(item.get("agent", ""))
         try:
             descriptor = master.registry.get(agent_name).descriptor
@@ -80,7 +104,11 @@ def build_task_graph(master: MasterAgent, *, workspace_root: str,
                     "errors": [{"code": "agent_unavailable", "message": agent_name}],
                     "trace": [_emit(progress_callback, "capability_discovery_failed", agent=agent_name)]}
         return {"selected_agent": agent_name, "selected_model": descriptor.provider_name,
-                "task": {**state.get("task", {}), **{k: v for k, v in item.items() if k != "task"}},
+                "relevant_files": relevant_files,
+                "routing": {k: v for k, v in item.items() if k not in {"task", "agent"}},
+                "task": {**state.get("task", {}),
+                          "enhanced_request": str(item.get("task", request)),
+                          **{k: v for k, v in item.items() if k not in {"task", "agent"}}},
                 "status": TaskStatus.PLANNED.value,
                 "trace": [_emit(progress_callback, "capability_discovery", agent=agent_name,
                                   capability=item.get("capability"), score=item.get("selection_score"))]}
@@ -108,12 +136,32 @@ def build_task_graph(master: MasterAgent, *, workspace_root: str,
         step["status"] = StepStatus.RUNNING.value
         spec = dict(state.get("task", {}))
         context = {**(request_context or {}), "workspace_root": workspace_root, "task_spec": spec,
+                   "repository_map": state.get("repository_map", {}),
+                   "relevant_files": state.get("relevant_files", []),
                    "agent_state": state.get("agent_memory", {}),
                    "nlp": {"original_text": state["original_request"],
                            "normalized_text": state.get("normalized_request", ""),
                            "enhanced_prompt": state.get("normalized_request", "")}}
+        context["handoff_prompt"] = handoff_prompt(
+            from_role="master_agent", to_role=state.get("selected_agent", "specialist"),
+            task=state["original_request"], objective=step.get("description", "complete the current step"),
+            state={"state_version": state.get("current_step_index", 0),
+                   "repository_map": state.get("repository_map", {}),
+                   "relevant_files": state.get("relevant_files", [])},
+            observation=state.get("observations", [])[-1:],
+            allowed_tools=state.get("relevant_files", []),
+        )
+        bundle = ContextBudgetManager().build(
+            system="AEGIS execution contract: use approved tools, provide evidence, and stop on policy failures.",
+            task=state["original_request"], facts=state.get("facts", []),
+            observation=state.get("observations", [])[-1:], tools=state.get("relevant_files", []),
+        )
+        context["context_bundle"] = bundle.text
+        context["context_metadata"] = {"prompt_chars": bundle.prompt_chars, "truncated": bundle.truncated,
+                                        "included_files": bundle.included_files}
+        delegation_request = str(spec.get("enhanced_request") or state["original_request"])
         result = await master.delegate_to_agent(
-            state["selected_agent"], state["original_request"], context=context,
+            state["selected_agent"], delegation_request, context=context,
             success_criteria=["structured evidence"], trace_id=state.get("run_id"))
         result_dict = result.model_dump()
         step["result"] = result_dict
@@ -151,6 +199,10 @@ def build_task_graph(master: MasterAgent, *, workspace_root: str,
                 **coding_check,
                 "evidence": [*verification.get("evidence", []), *coding_check.get("evidence", [])],
             }
+        if latest:
+            review = deterministic_review(workspace_root=workspace_root, result=latest[-1], verification=verification)
+            verification = {**verification, "review": review.model_dump(),
+                            "passed": bool(verification.get("passed") and review.passed)}
         # Artifact-producing specialists must carry their own deterministic
         # verification contract; reject a prose-only success.
         if verification.get("passed") and latest:
@@ -168,13 +220,21 @@ def build_task_graph(master: MasterAgent, *, workspace_root: str,
 
     async def self_heal(state: TaskRunState) -> dict[str, Any]:
         attempts = int(state.get("task_retry_count", 0))
+        result = (state.get("step_results") or [{}])[-1]
+        failure = classify_failure(result)
+        if not failure["retryable"]:
+            return {
+                "status": TaskStatus.FAILED.value,
+                "errors": [{**failure, "message": "Repair is not permitted for this policy or path failure."}],
+                "trace": [_emit(progress_callback, "repair_rejected",
+                                  reason="non_retryable", error_code=failure["error_code"])],
+            }
         if attempts >= int(state.get("max_task_retries", max_task_retries)):
             return {"status": TaskStatus.FAILED.value,
                     "errors": [{"code": "repair_budget_exhausted", "message": "No bounded repair remains."}],
                     "trace": [_emit(progress_callback, "repair_rejected", reason="budget_exhausted")]}
         # A repair is structured and capability-preserving: retry the same
         # specialist only for a retryable failure. No unrelated fallback agent.
-        result = (state.get("step_results") or [{}])[-1]
         decision = normalize_repair_action({"action": "retry", "reason": "retryable specialist failure"})
         return {"task_retry_count": attempts + 1, "repair_history": [decision],
                 "status": TaskStatus.RUNNING.value,
@@ -236,6 +296,8 @@ async def run_task_graph(master: MasterAgent, request: str, *, workspace_root: s
                              max_task_retries=max_task_retries,
                              request_context=request_context)
     state = await graph.ainvoke({"run_id": f"run_{uuid.uuid4().hex[:12]}",
+                                 "task_id": f"task_{uuid.uuid4().hex[:12]}",
+                                 "schema_version": 1,
                                  "original_request": request,
                                  "workspace_root": workspace_root,
                                  "max_task_retries": max_task_retries,

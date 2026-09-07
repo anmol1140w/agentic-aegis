@@ -2,6 +2,8 @@
 # Python Bytecode and Cache
 # =============================================================================
 __pycache__/
+native/build/
+native/bin/
 *.py[cod]
 *$py.class
 *.so
@@ -62,6 +64,7 @@ logs/*.log
 logs/*.jsonl
 *.log
 !logs/.gitkeep
+outputs/**
 
 # =============================================================================
 # Database and Storage Files
@@ -83,6 +86,15 @@ workspace/**
 
 # Allow README.md files
 !workspace/**/README.md
+
+# Keep small, reusable workspace examples; runtime outputs remain ignored.
+!workspace/pytest.ini
+!workspace/fixtures/*.py
+!workspace/fixtures/*.json
+!workspace/agent_test/*.py
+!workspace/artifacts/sample_*.json
+!workspace/executions/example_*.json
+!workspace/live_demo/*.py
 
 # Generated test artifacts and page extractions
 test_image.jpg
@@ -112,4 +124,3 @@ test_image.jpg
 .Trashes
 ehthumbs.db
 Thumbs.db
-

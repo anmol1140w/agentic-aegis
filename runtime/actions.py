@@ -156,7 +156,17 @@ def parse_action(raw: str) -> dict[str, Any]:
         answer = parsed.get("answer")
         if not isinstance(answer, str):
             raise ActionParseError("A final action requires a string answer.")
-        return {"action": "final", "answer": answer}
+        result = {"action": "final", "answer": answer}
+        if "status" in parsed:
+            if parsed["status"] not in {"verified", "blocked", "failed", "partial"}:
+                raise ActionParseError("Final status must be verified, blocked, failed, or partial.")
+            result["status"] = parsed["status"]
+        for key in ("evidence", "changed_files", "tests_run", "remaining_risks"):
+            if key in parsed:
+                if not isinstance(parsed[key], list) or not all(isinstance(item, str) for item in parsed[key]):
+                    raise ActionParseError(f"Final field '{key}' must be a list of strings.")
+                result[key] = parsed[key][:40]
+        return result
 
     if action == "tool":
         name = parsed.get("tool") or parsed.get("name")
@@ -221,7 +231,16 @@ def parse_action(raw: str) -> dict[str, Any]:
                     f"Tool '{name}' missing required argument(s): {', '.join(missing)}."
                 )
 
-        return {"action": "tool", "tool": name, "arguments": arguments}
+        result = {"action": "tool", "tool": name, "arguments": arguments}
+        if "expected_evidence" in parsed:
+            if not isinstance(parsed["expected_evidence"], list):
+                raise ActionParseError("expected_evidence must be a JSON list.")
+            result["expected_evidence"] = parsed["expected_evidence"][:20]
+        if "state_update" in parsed:
+            if not isinstance(parsed["state_update"], dict):
+                raise ActionParseError("state_update must be a JSON object.")
+            result["state_update"] = parsed["state_update"]
+        return result
 
     if action is None and isinstance(parsed.get("answer"), str):
         return {"action": "final", "answer": parsed["answer"]}

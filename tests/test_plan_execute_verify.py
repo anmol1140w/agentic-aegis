@@ -44,5 +44,6 @@ def test_coding_pytest_exit_zero_is_verified_from_recorded_state():
 
 def test_self_healing_classifies_policy_failures_as_non_retryable():
     assert classify_failure({"error": "approval_denied"})["retryable"] is False
+    assert classify_failure({"errors": ["approval_denied"]})["retryable"] is False
     assert classify_failure({"error": "command_timeout"})["retryable"] is True
     assert normalize_repair_action({"action": "retry", "parameters": {}})["action"] == "retry"

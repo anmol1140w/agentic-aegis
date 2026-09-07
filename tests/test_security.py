@@ -171,6 +171,23 @@ class TestNetworkMonitor:
         assert stats.local_model_calls == 2
         assert stats.local_tool_calls == 1
 
+    def test_named_local_external_and_total_counts(self) -> None:
+        monitor = NetworkMonitor()
+        monitor.record_model_call("llama3.2:1b", status="success")
+        monitor.record_model_call("remote-model", local=False, status="blocked")
+        monitor.record_tool_call("workspace.read.tree")
+        monitor.record_tool_call("network.fetch", local=False)
+
+        stats = monitor.snapshot()
+        report = monitor.report()
+
+        assert (stats.local_model_calls, stats.external_model_calls, stats.total_model_calls) == (1, 1, 2)
+        assert (stats.local_tool_calls, stats.external_tool_calls, stats.total_tool_calls) == (1, 1, 2)
+        assert report["model_call_details"][0] == {
+            "model": "llama3.2:1b", "local": "true", "status": "success"
+        }
+        assert report["tool_call_details"][-1]["tool"] == "network.fetch"
+
     def test_format_status(self) -> None:
         monitor = NetworkMonitor()
         status = monitor.format_status()

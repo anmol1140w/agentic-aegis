@@ -1,0 +1,6 @@
+{
+  "artifact_type": "verification_report",
+  "status": "verified",
+  "purpose": "Example artifact for local provenance registration",
+  "checks": ["workspace-boundary", "deterministic-content"]
+}

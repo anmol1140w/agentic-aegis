@@ -17,6 +17,21 @@ def test_workspace_outside_root_rejected(tmp_path: Path) -> None:
     assert WorkspaceReadTools(root).get_file_info(str(tmp_path / "outside.txt"))["error"] == "OutsideWorkspace"
 
 
+def test_workspace_creation_is_confined_to_root(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    outside = tmp_path / "outside.txt"
+    tools = WorkspaceReadTools(root, approver=lambda *_: True)
+
+    rejected = tools.create_file(str(outside), "must stay inside")
+    assert rejected["error"] == "OutsideWorkspace"
+    assert not outside.exists()
+
+    created = tools.create_file("inside.txt", "inside")
+    assert created["ok"] is True
+    assert (root / "inside.txt").read_text() == "inside"
+
+
 def test_workspace_read_tools_are_non_mutating(tmp_path: Path) -> None:
     root = tmp_path / "workspace"; root.mkdir()
     source = root / "notes.txt"; source.write_text("pump guard")

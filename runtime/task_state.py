@@ -63,6 +63,10 @@ class VerificationEvidence(TypedDict, total=False):
 
 
 class TaskRunState(TypedDict, total=False):
+    # Versioned AEGIS execution contract fields. They are optional at the
+    # TypedDict boundary so older callers and persisted runs remain readable.
+    schema_version: int
+    task_id: str
     run_id: str
     thread_id: str
     original_request: str
@@ -70,11 +74,17 @@ class TaskRunState(TypedDict, total=False):
     preprocessing: dict[str, Any]
     task: dict[str, Any]
     workspace_root: str
+    repository_root: str
+    repository_map: dict[str, Any]
+    relevant_files: list[str]
+    facts: list[str]
+    assumptions: list[str]
     selected_agent: str
     selected_model: str
     status: str
     plan: list[TaskStep]
     current_step_index: int
+    current_step: int
     task_retry_count: int
     max_task_retries: int
     max_step_retries: int
@@ -84,6 +94,18 @@ class TaskRunState(TypedDict, total=False):
     messages: list[Any]
     step_results: Annotated[list[dict[str, Any]], _append]
     verification: dict[str, Any]
+    verification_results: list[dict[str, Any]]
+    observations: Annotated[list[dict[str, Any]], _append]
+    hypotheses: list[str]
+    failures: Annotated[list[dict[str, Any]], _append]
+    patches: Annotated[list[dict[str, Any]], _append]
+    test_results: Annotated[list[dict[str, Any]], _append]
+    # LangGraph reserves the channel name ``checkpoint_id`` internally, so
+    # the graph carries this under an equivalent public state key.
+    checkpoint_ref: str
+    confidence: float
+    budgets: dict[str, Any]
+    escalation_level: int
     evidence: list[VerificationEvidence]
     repair_history: Annotated[list[dict[str, Any]], _append]
     changed_files: list[str]

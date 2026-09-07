@@ -38,7 +38,7 @@ models:
 
   llama-small:
     provider: ollama
-    model: "llama3.2:1b"
+    model: "Qwen2.5:1.5b"
     capabilities:
       - general
       - lightweight

@@ -13,6 +13,7 @@ import ipaddress
 import os
 import socket
 from dataclasses import dataclass, field
+from typing import Any
 
 import psutil
 
@@ -29,6 +30,12 @@ class NetworkStats:
     # Counters the application updates itself
     local_model_calls: int = 0
     local_tool_calls: int = 0
+    external_model_calls: int = 0
+    external_tool_calls: int = 0
+    total_model_calls: int = 0
+    total_tool_calls: int = 0
+    model_call_details: list[dict[str, str]] = field(default_factory=list)
+    tool_call_details: list[dict[str, str]] = field(default_factory=list)
     observed_external_connections: int = 0
     agent_local_connection_details: list[dict[str, str]] = field(default_factory=list)
     agent_external_connection_details: list[dict[str, str]] = field(default_factory=list)
@@ -57,19 +64,37 @@ class NetworkMonitor:
     def __init__(self, agent_pid: int | None = None) -> None:
         self._model_calls: int = 0
         self._tool_calls: int = 0
+        self._external_model_calls: int = 0
+        self._external_tool_calls: int = 0
+        self._model_details: list[dict[str, str]] = []
+        self._tool_details: list[dict[str, str]] = []
         self._agent_pid = agent_pid if agent_pid is not None else os.getpid()
 
-    def record_model_call(self) -> None:
-        self._model_calls += 1
+    def record_model_call(self, model: str = "unknown", *, local: bool = True, status: str = "started") -> None:
+        if local:
+            self._model_calls += 1
+        else:
+            self._external_model_calls += 1
+        self._model_details.append({"model": model, "local": str(local).lower(), "status": status})
 
-    def record_tool_call(self) -> None:
-        self._tool_calls += 1
+    def record_tool_call(self, tool: str = "unknown", *, local: bool = True, status: str = "started") -> None:
+        if local:
+            self._tool_calls += 1
+        else:
+            self._external_tool_calls += 1
+        self._tool_details.append({"tool": tool, "local": str(local).lower(), "status": status})
 
     def snapshot(self) -> NetworkStats:
         """Take a live snapshot of network connections."""
         stats = NetworkStats(
             local_model_calls=self._model_calls,
             local_tool_calls=self._tool_calls,
+            external_model_calls=self._external_model_calls,
+            external_tool_calls=self._external_tool_calls,
+            total_model_calls=self._model_calls + self._external_model_calls,
+            total_tool_calls=self._tool_calls + self._external_tool_calls,
+            model_call_details=list(self._model_details[-200:]),
+            tool_call_details=list(self._tool_details[-200:]),
         )
 
         try:
@@ -107,6 +132,32 @@ class NetworkMonitor:
 
         return stats
 
+    def report(self) -> dict[str, Any]:
+        """Return the complete serializable network and invocation report."""
+        stats = self.snapshot()
+        return {
+            "external_connection_count": stats.external_connections,
+            "external_connections": stats.external_connections,
+            "lan_connection_count": stats.lan_connections,
+            "lan_connections": stats.lan_connections,
+            "local_connection_count": stats.local_connections,
+            "local_connections": stats.local_connections,
+            "total_connection_count": stats.total_connections,
+            "total_connections": stats.total_connections,
+            "denied_attempts": [],
+            "agent_local_connections": stats.agent_local_connection_details,
+            "agent_external_connections": stats.agent_external_connection_details,
+            "observed_external_connection_count": stats.observed_external_connections,
+            "local_model_calls": stats.local_model_calls,
+            "external_model_calls": stats.external_model_calls,
+            "total_model_calls": stats.total_model_calls,
+            "local_tool_calls": stats.local_tool_calls,
+            "external_tool_calls": stats.external_tool_calls,
+            "total_tool_calls": stats.total_tool_calls,
+            "model_call_details": stats.model_call_details,
+            "tool_call_details": stats.tool_call_details,
+        }
+
     def format_status(self) -> str:
         """Human-readable one-liner for the terminal."""
         s = self.snapshot()
@@ -114,6 +165,6 @@ class NetworkMonitor:
             f"Agent network: external={s.external_connections} "
             f"local={s.local_connections} LAN={s.lan_connections} | "
             f"Observed elsewhere external={s.observed_external_connections} | "
-            f"Model calls: {s.local_model_calls}  "
-            f"Tool calls: {s.local_tool_calls}"
+            f"Model calls: {s.total_model_calls} (local={s.local_model_calls}, external={s.external_model_calls})  "
+            f"Tool calls: {s.total_tool_calls} (local={s.local_tool_calls}, external={s.external_tool_calls})"
         )

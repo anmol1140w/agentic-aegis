@@ -31,6 +31,8 @@ from rich.theme import Theme
 
 # Ensure project root is on sys.path
 _PROJECT_ROOT = Path(__file__).resolve().parent
+_WORKSPACE_ROOT = (_PROJECT_ROOT / "workspace").resolve()
+_WORKSPACE_ROOT.mkdir(parents=True, exist_ok=True)
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
@@ -39,6 +41,7 @@ from runtime.orchestrator import Orchestrator
 from security.audit import AuditLogger
 from security.network import NetworkMonitor
 from tools.workspace import WorkspaceReadTools
+from tools.files import set_workspace_root
 
 # ---------------------------------------------------------------------------
 # Rich theme
@@ -63,11 +66,24 @@ console = Console(theme=_THEME)
 
 def _print_banner() -> None:
     console.set_window_title("AEGIS — Sovereign Agent Workbench")
+    glyphs = {
+        "A": (" █████ ", "██   ██", "███████", "██   ██", "██   ██"),
+        "E": ("███████", "██     ", "█████  ", "██     ", "███████"),
+        "G": (" ██████ ", "██      ", "██ ████ ", "██   ██ ", " ██████ "),
+        "I": ("███████", "   ██  ", "   ██  ", "   ██  ", "███████"),
+        "S": (" ██████", "██     ", " █████  ", "     ██ ", "██████  "),
+    }
+    rows = ["  ".join(glyphs[letter][row] for letter in "AEGIS") for row in range(5)]
+
     banner = Text()
-    banner.append("AEGIS", style="bold bright_cyan")
-    banner.append("  Sovereign Agent Workbench", style="bold blue")
+    # A small offset extrusion gives the wordmark a 3-D terminal effect while
+    # remaining safe on terminals that do not support cursor positioning.
+    for index, row in enumerate(rows):
+        banner.append("  " + row.replace("█", "▓") + "╲\n", style="bold blue")
+        banner.append(row + "╲\n", style="bold bright_cyan")
     banner.append("\n")
-    banner.append("Local inference  •  private workspace  •  policy-controlled tools", style="dim")
+    banner.append("  A  E  G  I  S   •   SOVEREIGN AGENT WORKBENCH\n", style="bold white")
+    banner.append("  Local inference  •  private workspace  •  policy-controlled tools", style="dim")
     console.print(Panel(banner, border_style="bright_cyan", padding=(1, 3)))
 
 
@@ -180,8 +196,8 @@ async def _handle_slash_command(raw_input: str, registry: ModelRegistry, network
         _print_network(network)
         return "handled"
     if command == "/sandbox":
-        # Probe the same project-root sandbox used by the production agent.
-        tools = WorkspaceReadTools(_PROJECT_ROOT, command_approver=lambda *_: True)
+        # Probe the same canonical workspace used by the production agent.
+        tools = WorkspaceReadTools(_WORKSPACE_ROOT, command_approver=lambda *_: True)
         status = tools.sandbox_status()
         if not status.get("ready"):
             console.print(Panel(
@@ -267,6 +283,7 @@ async def _run() -> None:
         )
 
     # Initialise components
+    set_workspace_root(_WORKSPACE_ROOT)
     audit = AuditLogger()
     network = NetworkMonitor()
     orchestrator = Orchestrator(
@@ -274,7 +291,7 @@ async def _run() -> None:
         audit=audit,
         network=network,
         availability=availability,
-        workspace_root=_PROJECT_ROOT,
+        workspace_root=_WORKSPACE_ROOT,
     )
     thread_id = f"session-{uuid.uuid4().hex[:8]}"
     master_mode = False
