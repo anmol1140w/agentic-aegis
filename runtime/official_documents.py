@@ -67,5 +67,5 @@ class OfficialDocumentWorkflow:
         state.status = "generated"
         state.human_approved = True
         state.output_path = str(output)
-    return {"ok": True, "status": state.status, "request_id": request_id,
-            "approval_required": True, "human_approved": True, "path": str(output)}
+        return {"ok": True, "status": state.status, "request_id": request_id,
+                "approval_required": True, "human_approved": True, "path": str(output)}
