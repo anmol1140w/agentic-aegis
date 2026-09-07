@@ -307,6 +307,8 @@ def build_task_graph(master: MasterAgent, *, workspace_root: str,
         verification = state.get("verification", {})
         result = (state.get("step_results") or [{}])[-1]
         answer = result.get("summary", "") if verification.get("passed") else "Task completed without sufficient deterministic evidence."
+        if verification.get("passed") and not str(answer).strip():
+            answer = "Completed with verified deterministic evidence."
         # A model can emit a conservative/contradictory final sentence after a
         # successful mutation. Deterministic evidence is authoritative here:
         # report the verified artifact instead of surfacing a false failure.

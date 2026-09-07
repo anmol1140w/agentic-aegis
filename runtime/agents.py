@@ -627,7 +627,10 @@ class OllamaSpecialistAgent(BaseAgent):
                     # JSON is the machine contract, but a short labeled
                     # evidence block makes failure diagnosis reliable for
                     # local models that under-attend to deeply nested fields.
-                    if isinstance(last_tool_result, dict) and last_tool_result.get("exit_code") is not None:
+                    if (isinstance(last_tool_result, dict) and
+                            (last_tool_result.get("exit_code") is not None or
+                             last_tool_result.get("status") == "failure" or
+                             verification.get("status") == "failed")):
                         source_block = "\n\n".join(
                             f"FILE {path}:\n{content}" for path, content in list(known_files.items())[-3:]
                         )
@@ -638,8 +641,10 @@ class OllamaSpecialistAgent(BaseAgent):
                             f"STDOUT:\n{last_tool_result.get('stdout', '')}\n"
                             f"STDERR:\n{last_tool_result.get('stderr', '')}\n"
                             "INSPECTED SOURCE:\n" + source_block + "\n"
-                            "NEXT STEP: diagnose this failure and edit an implementation file; do not edit a test "
-                            "unless the evidence proves the test is incorrect."
+                            "EVIDENCE LOG:\n" + "\n".join(evidence[-12:]) + "\n"
+                            "NEXT STEP: diagnose this failure using the exact inspected source. For an edit, choose "
+                            "a unique old_text excerpt that exists exactly once; do not repeat an ambiguous or "
+                            "missing replacement. Do not edit a test unless the evidence proves the test is incorrect."
                         )
                     stream_method = getattr(type(self.provider), "stream_chat_events", None)
                     if callable(stream_method):
@@ -820,7 +825,7 @@ class OllamaSpecialistAgent(BaseAgent):
                                            metadata={"coding_state": coding_state_snapshot()})
                     continue
                 if (state_key_text in completed_action_states or action_state_counts[state_key] >= 2) and name in {
-                    "read_file", "list_directory", "tree", "repository_context", "search_files", "find_files", "execute_command"
+                    "read_file", "list_directory", "tree", "repository_context", "search_files", "find_files", "execute_command", "edit_file"
                 }:
                     hint = (
                         f"Duplicate action rejected: {name} with these arguments was already executed in the current "
