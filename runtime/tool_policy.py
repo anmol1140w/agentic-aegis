@@ -114,6 +114,21 @@ class PolicyEngine:
         for raw in paths:
             if not self._path_allowed(raw, policy.filesystem):
                 return PolicyDecision(False, reason=f"Path '{raw}' is outside the {policy.filesystem} scope", policy=policy, paths=paths)
+        if name == "execute_command":
+            cmd = str(args.get("command", "")).strip()
+            if cmd:
+                try:
+                    from runtime.command_policy import evaluate_command
+                    cwd_arg = str(args.get("cwd", ".")).strip() or "."
+                    cwd_path = (self.workspace_root / cwd_arg).resolve() if not Path(cwd_arg).is_absolute() else Path(cwd_arg).resolve()
+                    cmd_decision = evaluate_command(cmd, cwd_path, self.workspace_root)
+                    if not cmd_decision.allowed:
+                        return PolicyDecision(False, reason=cmd_decision.reason, policy=policy, paths=paths)
+                    return PolicyDecision(True, approval_required=cmd_decision.requires_approval,
+                                          reason="approval required" if cmd_decision.requires_approval else "allowed",
+                                          policy=policy, paths=paths)
+                except Exception:
+                    pass
         return PolicyDecision(True, approval_required=policy.requires_approval,
                               reason="approval required" if policy.requires_approval else "allowed",
                               policy=policy, paths=paths)
@@ -194,21 +209,27 @@ class PolicyEngine:
                         return validation
                 except TypeError:
                     pass
+            approval_token = None
             if decision.approval_required:
                 requester = self.approval_requester
                 request_id = f"approval:{task_id or 'run'}:{name}"
                 if requester is None or not requester(request_id, name, self._approval_details(parameters)):
                     raise ApprovalRequired(request_id, f"Human approval required for tool '{name}'")
+                approval_token = _APPROVAL_GRANTED.set(True)
             started = time.monotonic()
-            value = function(*args, **kwargs)
-            if inspect.isawaitable(value):
-                raise PolicyDenied("Async callable must be invoked through the async policy gateway")
-            policy = decision.policy
-            if isinstance(value, str) and policy:
-                value = value[:policy.max_output]
-            self._record("tool_execution", name=name, task_id=task_id,
-                         duration_ms=round((time.monotonic() - started) * 1000, 2))
-            return value
+            try:
+                value = function(*args, **kwargs)
+                if inspect.isawaitable(value):
+                    raise PolicyDenied("Async callable must be invoked through the async policy gateway")
+                policy = decision.policy
+                if isinstance(value, str) and policy:
+                    value = value[:policy.max_output]
+                return value
+            finally:
+                if approval_token is not None:
+                    _APPROVAL_GRANTED.reset(approval_token)
+                self._record("tool_execution", name=name, task_id=task_id,
+                             duration_ms=round((time.monotonic() - started) * 1000, 2))
         return invoke
 
     def _path_allowed(self, raw: str, scope: str) -> bool:

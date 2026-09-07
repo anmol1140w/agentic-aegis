@@ -448,7 +448,30 @@ async def _run() -> None:
                     f"{meta.get('entity_count', 0)} entities, "
                     f"{meta.get('processing_duration_ms', 0):.1f}ms"
                 )
-            answer = str(master_result.get("final_answer", "Master could not complete the request."))
+            raw_answer = str(master_result.get("final_answer", "Master could not complete the request."))
+            # Sanitize: if the model returned a raw task-spec JSON blob as the
+            # answer (keys like "operation", "original_request", etc.), replace
+            # it with a human-readable fallback so the panel is readable.
+            try:
+                import json as _j
+                _parsed = _j.loads(raw_answer.strip())
+                _machine = isinstance(_parsed, dict) and bool(
+                    {"operation", "original_request", "normalized_request",
+                     "agent", "domain_intent", "workflow"} & _parsed.keys()
+                )
+            except Exception:
+                _machine = False
+            if _machine:
+                _changes = master_result.get("agent_results", [{}])[-1].get("changes", []) if master_result.get("agent_results") else []
+                _arts = master_result.get("agent_results", [{}])[-1].get("artifacts", []) if master_result.get("agent_results") else []
+                if _changes:
+                    answer = "Modified: " + ", ".join(str(p) for p in _changes[:6]) + "."
+                elif _arts:
+                    answer = "Produced: " + ", ".join(str(a) for a in _arts[:4]) + "."
+                else:
+                    answer = "Task completed. See output directory for artifacts."
+            else:
+                answer = raw_answer
             console.print(Panel(answer, title="[bold bright_cyan]AEGIS Response[/bold bright_cyan]", border_style="green" if not master_result.get("errors") else "yellow"))
             if master_result.get("errors"):
                 console.print(f"[warning]Master errors: {master_result['errors']}[/warning]")

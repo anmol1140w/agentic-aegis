@@ -250,6 +250,15 @@ def build_task_graph(master: MasterAgent, *, workspace_root: str,
         # A repaired step supersedes its failed attempt for final verification;
         # the complete history remains available in ``step_results`` and trace.
         latest = state.get("step_results", [])[-1:]
+        if latest and latest[-1].get("status") not in {AgentStatus.SUCCESS.value, "success"}:
+            verification = {
+                "passed": False, "status": "failed",
+                "summary": "The specialist execution did not succeed; verification is unresolved.",
+                "evidence": [], "missing_evidence": ["successful specialist execution"],
+            }
+            return {"verification": verification, "status": TaskStatus.HEALING.value,
+                    "trace": [_emit(progress_callback, "verification_failed",
+                                      summary=verification["summary"], next_step=False)]}
         verification = verify_plan(latest)
         if latest and latest[-1].get("agent") == "coding_agent":
             coding_check = verify_coding_result(latest[-1], state.get("original_request", ""))
@@ -306,9 +315,53 @@ def build_task_graph(master: MasterAgent, *, workspace_root: str,
     async def review_and_finish(state: TaskRunState) -> dict[str, Any]:
         verification = state.get("verification", {})
         result = (state.get("step_results") or [{}])[-1]
-        answer = result.get("summary", "") if verification.get("passed") else "Task completed without sufficient deterministic evidence."
-        if verification.get("passed") and not str(answer).strip():
-            answer = "Completed with verified deterministic evidence."
+        raw_summary = result.get("summary", "") if verification.get("passed") else "Task completed without sufficient deterministic evidence."
+
+        # Guard: if the "summary" is a raw-JSON task-spec blob (e.g. it starts
+        # with '{' and contains machine keys like "original_request"), replace
+        # it with a human-readable reconstruction from verified evidence.
+        def _is_machine_json(text: str) -> bool:
+            t = str(text).strip()
+            if not t.startswith("{"):
+                return False
+            import json as _json
+            try:
+                parsed = _json.loads(t)
+                if isinstance(parsed, dict):
+                    machine_keys = {"operation", "original_request", "normalized_request",
+                                    "agent", "domain_intent", "workflow", "artifact_format",
+                                    "modality", "required_capabilities", "compound_steps"}
+                    return bool(machine_keys & parsed.keys())
+            except Exception:
+                pass
+            return False
+
+        def _human_answer(res: dict) -> str:
+            changes = res.get("changes", [])
+            evidence = res.get("evidence", [])
+            artifacts = res.get("artifacts", [])
+            verification_inner = res.get("verification", {})
+            cmd = verification_inner.get("command", "")
+            if changes:
+                label = "Modified" if any("edit" in str(e) for e in evidence) else "Created"
+                paths = ", ".join(str(p) for p in changes[:8])
+                suffix = f" — command: {cmd}" if cmd else ""
+                return f"{label}: {paths}{suffix}."
+            if artifacts:
+                return "Produced: " + ", ".join(str(a) for a in artifacts[:4]) + "."
+            reads = [e for e in evidence if str(e).startswith("read_file:")]
+            if reads:
+                return "Inspection complete. " + "; ".join(str(r)[:120] for r in reads[:3]) + "."
+            return "Completed with verified deterministic evidence."
+
+        answer: str
+        if not str(raw_summary).strip():
+            answer = "Completed with verified deterministic evidence." if verification.get("passed") else "Task completed without sufficient deterministic evidence."
+        elif _is_machine_json(str(raw_summary)):
+            answer = _human_answer(result)
+        else:
+            answer = str(raw_summary)
+
         # A model can emit a conservative/contradictory final sentence after a
         # successful mutation. Deterministic evidence is authoritative here:
         # report the verified artifact instead of surfacing a false failure.
@@ -317,13 +370,22 @@ def build_task_graph(master: MasterAgent, *, workspace_root: str,
             if not isinstance(changes, list):
                 changes = []
             answer = "Created and verified: " + ", ".join(str(path) for path in changes) if changes else "Completed with verified deterministic evidence."
-        return {"final_answer": answer, "status": TaskStatus.COMPLETED.value if verification.get("passed") else TaskStatus.FAILED.value,
+        unresolved = any(
+            "max tool steps reached" in str(item).lower()
+            for item in (result.get("errors", []) if isinstance(result, dict) else [])
+        )
+        completed = bool(verification.get("passed")) and not unresolved and result.get("status") in {AgentStatus.SUCCESS.value, "success"}
+        return {"final_answer": answer, "status": TaskStatus.COMPLETED.value if completed else TaskStatus.FAILED.value,
                 "trace": [_emit(progress_callback, "final", status="verified" if verification.get("passed") else "failed")]}
 
     async def safe_failure(state: TaskRunState) -> dict[str, Any]:
         errors = state.get("errors") or [{"code": "task_failed", "message": "Task stopped safely."}]
+        verification = state.get("verification") or {}
+        # A failed terminal path must never retain a stale successful
+        # verification flag from an earlier node or specialist result.
+        verification = {**verification, "passed": False, "status": "failed"}
         return {"final_answer": "Unable to complete the requested task: " + "; ".join(str(e.get("message", e)) for e in errors),
-                "status": TaskStatus.FAILED.value,
+                "status": TaskStatus.FAILED.value, "verification": verification,
                 "trace": [_emit(progress_callback, "run_failed", errors=errors)]}
 
     def after_validate(state: TaskRunState) -> str:

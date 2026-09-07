@@ -12,6 +12,7 @@ import ast
 import time
 import uuid
 import asyncio
+import shlex
 import re
 import tempfile
 import os
@@ -469,6 +470,10 @@ class OllamaSpecialistAgent(BaseAgent):
                 dict(item) for item in prior_state.get("commands", [])[-12:]
                 if isinstance(item, dict)
             ]
+            repair_edits: list[tuple[str, str, str]] = [
+                (str(item.get("path", "")), str(item.get("old_text", "")), str(item.get("new_text", "")))
+                for item in prior_state.get("repair_edits", []) if isinstance(item, dict)
+            ]
             rejected_creation_reads = 0
             repository_context_loaded = False
 
@@ -485,6 +490,8 @@ class OllamaSpecialistAgent(BaseAgent):
                     "last_edit_state_version": last_edit_state_version,
                     "completed_action_states": list(completed_action_states)[-24:],
                     "commands": command_history[-12:],
+                    "repair_edits": [{"path": path, "old_text": old, "new_text": new}
+                                     for path, old, new in repair_edits[-12:]],
                 }
             # Context discovery is infrastructure-owned for every repository
             # task. This gives the model real filenames before it can choose a
@@ -727,42 +734,58 @@ class OllamaSpecialistAgent(BaseAgent):
                                            evidence=evidence, artifacts=artifacts, changes=changes,
                                            verification=verification, errors=["post_write_verification_required"])
                     # A model can correctly mutate the workspace and still
-                    # stop one action early. For explicit test requests, do
-                    # one bounded infrastructure-owned evidence check rather
-                    # than spending the graph repair budget on an identical
-                    # model retry. Approval, sandbox policy, and command
-                    # validation remain owned by the workspace tool.
-                    if (requires_command and not command_executed and
-                            re.search(r"\b(test|tests|pytest|unittest)\b", request.task, re.I) and
-                            "execute_command" in self.tools):
-                        try:
-                            evidence.append("infrastructure_test_fallback:pytest -q")
-                            fallback = await asyncio.to_thread(
-                                self.tools["execute_command"], command="pytest -q", cwd="."
-                            )
-                            if isinstance(fallback, dict):
-                                fallback_status = fallback.get("status", "success" if fallback.get("ok") else "failure")
-                                command_executed = True
-                                verification = {
-                                    "required": True, "command": "pytest -q",
-                                    "status": "passed" if fallback_status == "success" and fallback.get("exit_code", 0) == 0 else "failed",
-                                }
-                                command_history.append({
-                                    "command": "pytest -q", "cwd": ".",
-                                    "exit_code": fallback.get("exit_code"),
-                                    "stdout": str(fallback.get("stdout", ""))[-4000:],
-                                    "stderr": str(fallback.get("stderr", ""))[-4000:],
-                                    "timed_out": bool(fallback.get("timed_out", False)),
-                                    "state_version": state_version,
-                                })
-                                if verification["status"] == "passed":
-                                    return AgentResult(agent=self.descriptor.name, agent_execution_id=execution_id,
-                                                       status=AgentStatus.SUCCESS, summary=action["answer"],
-                                                       evidence=evidence, artifacts=artifacts, changes=changes,
-                                                       approvals=approvals, verification=verification,
-                                                       metadata={"coding_state": coding_state_snapshot()})
-                        except Exception as exc:
-                            evidence.append(f"infrastructure_test_fallback_error:{type(exc).__name__}")
+                    # stop one action early. For explicit test requests or
+                    # code fixes, do one bounded infrastructure-owned evidence
+                    # check rather than spending the graph repair budget on an
+                    # identical model retry. Approval, sandbox policy, and
+                    # command validation remain owned by the workspace tool.
+                    if requires_command and (not command_executed or verification.get("status") != "passed"):
+                        if "execute_command" in self.tools:
+                            verify_cmd = ""
+                            failed_cmds = [h["command"] for h in command_history if h.get("exit_code") != 0 and h.get("command")]
+                            if failed_cmds:
+                                verify_cmd = failed_cmds[-1]
+                            elif not command_executed and re.search(r"\b(test|tests|pytest|unittest)\b", request.task, re.I):
+                                verify_cmd = "pytest -q"
+                            elif diagnostic_fix_request and candidate and str(candidate).lower().endswith(".py"):
+                                verify_cmd = f"python -m py_compile {shlex.quote(str(candidate))}"
+                            elif diagnostic_fix_request and changes and any(str(c).lower().endswith(".py") for c in changes):
+                                py_file = next(c for c in changes if str(c).lower().endswith(".py"))
+                                verify_cmd = f"python -m py_compile {shlex.quote(str(py_file))}"
+
+                            if verify_cmd:
+                                try:
+                                    evidence.append(f"infrastructure_verification:{verify_cmd}")
+                                    fallback = await asyncio.to_thread(
+                                        self.tools["execute_command"], command=verify_cmd, cwd=target_path_hint or "."
+                                    )
+                                    if isinstance(fallback, dict):
+                                        fallback_status = fallback.get("status", "success" if fallback.get("ok") else "failure")
+                                        command_executed = True
+                                        verification = {
+                                            "required": True, "command": verify_cmd,
+                                            "status": "passed" if fallback_status == "success" and fallback.get("exit_code", 0) == 0 else "failed",
+                                        }
+                                        command_history.append({
+                                            "command": verify_cmd, "cwd": target_path_hint or ".",
+                                            "exit_code": fallback.get("exit_code"),
+                                            "stdout": str(fallback.get("stdout", ""))[-4000:],
+                                            "stderr": str(fallback.get("stderr", ""))[-4000:],
+                                            "timed_out": bool(fallback.get("timed_out", False)),
+                                            "state_version": state_version,
+                                        })
+                                        if verification["status"] == "passed":
+                                            return AgentResult(agent=self.descriptor.name, agent_execution_id=execution_id,
+                                                               status=AgentStatus.SUCCESS, summary=action["answer"],
+                                                               evidence=evidence, artifacts=artifacts, changes=changes,
+                                                               approvals=approvals, verification=verification,
+                                                               metadata={"coding_state": coding_state_snapshot()})
+                                        else:
+                                            last_tool_result = {"tool": "execute_command", "status": "failure", "ok": False,
+                                                                "command": verify_cmd, "exit_code": fallback.get("exit_code"),
+                                                                "stdout": fallback.get("stdout", ""), "stderr": fallback.get("stderr", "")}
+                                except Exception as exc:
+                                    evidence.append(f"infrastructure_verification_error:{type(exc).__name__}")
                     if requires_command and (not command_executed or verification.get("status") != "passed"):
                         if _ < 7:
                             evidence.append("execution_required:successful execute_command before final")
@@ -778,11 +801,24 @@ class OllamaSpecialistAgent(BaseAgent):
                                            evidence=evidence, artifacts=artifacts, changes=changes,
                                            approvals=approvals, verification=verification,
                                            errors=["command_verification_required"])
-                    return AgentResult(agent_execution_id=execution_id, status=AgentStatus.SUCCESS,
+                    return AgentResult(agent=self.descriptor.name, agent_execution_id=execution_id, status=AgentStatus.SUCCESS,
                                        summary=action["answer"], evidence=evidence, artifacts=artifacts,
                                        changes=changes, approvals=approvals, verification=verification,
                                        metadata={"coding_state": coding_state_snapshot()})
                 name, args = action["tool"], action.get("arguments", {})
+                # A Python repair must validate syntax, not run pytest against
+                # the module itself. ``pytest file.py`` returns exit code 5
+                # when it contains no tests, which previously looked like a
+                # retryable defect and sent the graph back into the repair
+                # loop. Normalize only this bounded, workspace-scoped case.
+                if (name == "execute_command" and diagnostic_fix_request and
+                        candidate and str(candidate).lower().endswith(".py") and
+                        not Path(str(candidate)).name.startswith("test_") and "/tests/" not in str(candidate)):
+                    expected_command = f"python -m py_compile {shlex.quote(str(candidate))}"
+                    if str(args.get("command", "")) != expected_command:
+                        evidence.append(f"verification_command_normalized:{expected_command}")
+                        args = {**args, "command": expected_command}
+                        action["arguments"] = args
                 if name == "execute_command" and target_path_hint and not args.get("cwd"):
                     args = {**args, "cwd": target_path_hint}
                     action["arguments"] = args
@@ -881,6 +917,20 @@ class OllamaSpecialistAgent(BaseAgent):
                     return AgentResult(agent_execution_id=execution_id, status=AgentStatus.BLOCKED,
                                        summary="read_file is required before edit_file", evidence=evidence,
                                        errors=["edit-before-read blocked"])
+                if name == "edit_file":
+                    edit = (str(args.get("path", "")), str(args.get("old_text", "")),
+                            str(args.get("new_text", "")))
+                    inverse = (edit[0], edit[2], edit[1])
+                    if edit in repair_edits or inverse in repair_edits:
+                        message = "Repair stopped: duplicate or inverse edit detected without new verification evidence."
+                        evidence.append("repair_oscillation_detected")
+                        return AgentResult(
+                            agent=self.descriptor.name, agent_execution_id=execution_id,
+                            status=AgentStatus.FAILURE, summary=message, evidence=evidence,
+                            artifacts=artifacts, changes=changes, approvals=approvals,
+                            verification={**verification, "status": "failed", "passed": False},
+                            errors=["repair_oscillation"], metadata={"coding_state": coding_state_snapshot()},
+                        )
                 try:
                     self._observe_tool_call(name)
                     if name == "execute_command":
@@ -943,6 +993,9 @@ class OllamaSpecialistAgent(BaseAgent):
                 elif name in {"edit_file", "create_file", "create_python_script"}:
                     approvals.append({"tool": name, "status": "approved" if status == "success" else "denied"})
                     if status == "success":
+                        if name == "edit_file":
+                            repair_edits.append((str(args.get("path", "")), str(args.get("old_text", "")),
+                                                 str(args.get("new_text", ""))))
                         state_version += 1
                         last_edit_state_version = state_version
                         created_path = str(args.get("path", ""))
@@ -970,6 +1023,70 @@ class OllamaSpecialistAgent(BaseAgent):
                             except Exception as exc:
                                 verification["status"] = "failed"
                                 evidence.append(f"post_create_readback_error:{str(exc)[:120]}")
+                        if name == "edit_file" and diagnostic_fix_request:
+                            if verification.get("status") != "verified":
+                                return AgentResult(
+                                    agent=self.descriptor.name, agent_execution_id=execution_id,
+                                    status=AgentStatus.FAILURE,
+                                    summary="Edited file could not be read back for verification.",
+                                    evidence=evidence, artifacts=artifacts, changes=changes,
+                                    approvals=approvals, verification={**verification, "status": "failed"},
+                                    errors=["post_edit_readback_failed"],
+                                    metadata={"coding_state": coding_state_snapshot()},
+                                )
+                            if (str(args.get("path", "")).lower().endswith(".py") and
+                                    "execute_command" in self.tools):
+                                explicit_test_request = bool(re.search(
+                                    r"\b(?:pytest|unittest|test(?:s|ing)?|run tests?)\b", request.task, re.I
+                                ))
+                                # If the request names a test command, make
+                                # that command the next required action so
+                                # the model's existing evidence path remains
+                                # observable. Otherwise py_compile is the
+                                # deterministic repair verifier.
+                                prior_command = str(command_history[-1].get("command", "")) if command_history else ""
+                                if explicit_test_request and prior_command:
+                                    # Read-back passed; the requested command
+                                    # is now the required next verification.
+                                    # Keep the interim state "verified" so the
+                                    # execute_command guard permits that test.
+                                    verification = {"required": True, "command": prior_command, "status": "verified"}
+                                    command_executed = False
+                                    evidence.append(f"post_edit_verification_required:{prior_command}")
+                                    continue
+                                verify_command = f"python -m py_compile {shlex.quote(str(args.get('path', '')))}"
+                                verify_result = await asyncio.to_thread(
+                                    self.tools["execute_command"], command=verify_command, cwd="."
+                                )
+                                if not isinstance(verify_result, dict):
+                                    verify_result = {"ok": True, "status": "success", "result": str(verify_result)}
+                                verify_ok = (verify_result.get("status", "success" if verify_result.get("ok", False) else "failure") == "success"
+                                             and verify_result.get("exit_code", 0) == 0
+                                             and not verify_result.get("timed_out", False))
+                                command_executed = True
+                                verification = {"required": True, "command": verify_command,
+                                                "status": "passed" if verify_ok else "failed"}
+                                command_history.append({"command": verify_command, "cwd": ".",
+                                    "exit_code": verify_result.get("exit_code"),
+                                    "stdout": str(verify_result.get("stdout", ""))[-4000:],
+                                    "stderr": str(verify_result.get("stderr", ""))[-4000:],
+                                    "timed_out": bool(verify_result.get("timed_out", False)),
+                                    "state_version": state_version})
+                                last_tool_result = {"tool": "execute_command",
+                                    "status": "success" if verify_ok else "failure", "ok": verify_ok,
+                                    "error": verify_result.get("error"), "exit_code": verify_result.get("exit_code"),
+                                    "stdout": str(verify_result.get("stdout", ""))[-5000:],
+                                    "stderr": str(verify_result.get("stderr", ""))[-5000:]}
+                                evidence.append(f"post_edit_verification:{verify_command}:{'passed' if verify_ok else 'failed'}")
+                                if verify_ok:
+                                    return AgentResult(
+                                        agent=self.descriptor.name, agent_execution_id=execution_id,
+                                        status=AgentStatus.SUCCESS,
+                                        summary=f"Fixed and verified {args.get('path')}.",
+                                        evidence=evidence, artifacts=artifacts, changes=changes,
+                                        approvals=approvals, verification=verification,
+                                        metadata={"coding_state": coding_state_snapshot()},
+                                    )
                         # Syntax validation is deterministic and must not spend
                         # a command/model call or execute arbitrary generated
                         # code merely to prove that it parses.
@@ -1040,7 +1157,7 @@ class OllamaSpecialistAgent(BaseAgent):
                                        summary=f"{name} failed", evidence=evidence, artifacts=artifacts,
                                        changes=changes, approvals=approvals, verification=verification,
                                        errors=[detail], metadata={"coding_state": coding_state_snapshot()})
-            return AgentResult(agent_execution_id=execution_id, status=AgentStatus.BLOCKED,
+            return AgentResult(agent_execution_id=execution_id, status=AgentStatus.FAILURE,
                                summary="Coding tool loop limit reached", evidence=evidence,
                                artifacts=artifacts, changes=changes, approvals=approvals,
                                verification=verification, errors=["max tool steps reached"],

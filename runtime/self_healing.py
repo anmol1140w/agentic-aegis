@@ -9,6 +9,7 @@ from runtime.contracts import FailureRecord
 NON_RETRYABLE = {
     "approval_denied", "OutsideWorkspace", "path_escape", "disallowed_command",
     "permission_denied", "path_not_established", "edit-before-read blocked",
+    "repair_oscillation", "max tool steps reached", "post_edit_readback_failed",
 }
 
 

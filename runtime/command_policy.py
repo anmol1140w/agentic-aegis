@@ -151,6 +151,19 @@ def evaluate_command(
             command_name="pytest",
         )
 
+    # Syntax-only validation used by the repair workflow. It does not execute
+    # module code and is therefore distinct from workspace-local Python
+    # execution below.
+    if (base_first in ("python", "python3") and len(tokens) == 4 and
+            tokens[1] == "-m" and tokens[2] == "py_compile" and
+            tokens[3].lower().endswith(".py")):
+        return CommandPolicyDecision(
+            allowed=True,
+            requires_approval=False,
+            reason="Allowed Python syntax validation",
+            command_name="py_compile",
+        )
+
     # Narrow process-observation probe used by the terminal sandbox smoke test.
     # It exposes only PID/PPID/time and cannot read files or spawn processes.
     if base_first in ("python", "python3") and len(tokens) == 3 and tokens[1] == "-c":

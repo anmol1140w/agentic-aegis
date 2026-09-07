@@ -110,6 +110,21 @@ async def test_universal_graph_does_not_retry_policy_denial():
 
 
 @pytest.mark.asyncio
+async def test_max_tool_steps_cannot_be_reported_as_verified_completion():
+    result = AgentResult(
+        agent="coding_agent", status=AgentStatus.FAILURE,
+        summary="Coding tool loop limit reached",
+        errors=["max tool steps reached"],
+        verification={"required": True, "status": "passed"},
+    )
+    state = await run_task_graph(_Master(result), "fix the error in fibonacci.py",
+                                 workspace_root=".", max_task_retries=3)
+    assert state["status"] == "failed"
+    assert state["verification"]["passed"] is False
+    assert any("max tool steps reached" in str(item).lower() for item in state["errors"])
+
+
+@pytest.mark.asyncio
 async def test_graph_repair_reuses_specialist_working_memory():
     master = _RepairMaster()
     state = await run_task_graph(master, "fix the failing test", workspace_root=".", max_task_retries=1)
@@ -144,3 +159,69 @@ async def test_verified_file_change_overrides_contradictory_model_summary():
     state = await run_task_graph(_CodingSuccessWithoutEvidence(result), "create a py file on doubly linked list", workspace_root=".", max_task_retries=0)
     assert state["status"] == "completed"
     assert state["final_answer"] == "Created and verified: doubly_linked_list.py"
+
+
+@pytest.mark.asyncio
+async def test_review_and_finish_sanitizes_raw_json_summary():
+    """If the agent summary is a raw task-spec JSON blob, the final answer
+    must be a human-readable string, not the raw dict stringified."""
+    import json
+
+    raw_blob = json.dumps({
+        "operation": "analyze",
+        "original_request": "fix the error in fibonacci.py",
+        "normalized_request": "fix the error in fibonacci.py",
+        "agent": "coding_agent",
+        "domain_intent": "general",
+        "workflow": "general_reasoning",
+        "artifact_format": None,
+        "modality": "text",
+        "required_capabilities": ["reasoning"],
+        "compound_steps": [],
+    })
+
+    # The verify_coding_result check for "fix" tasks requires command evidence.
+    # Supply a successful py_compile run in commands so the coding check passes.
+    result = AgentResult(
+        agent="coding_agent", status=AgentStatus.SUCCESS,
+        summary=raw_blob,
+        changes=["fibonacci.py"],
+        evidence=["edit_file:fibonacci.py (fixed)", "py_compile:success"],
+        verification={"required": True, "status": "verified"},
+        metadata={
+            "coding_state": {
+                "files_read": {"fibonacci.py": "def fibonacci(n): ..."},
+                "changes": ["fibonacci.py"],
+                "evidence": ["edit_file:fibonacci.py (fixed)", "py_compile:success"],
+                "last_tool_result": {"tool": "execute_command", "ok": True, "exit_code": 0,
+                                     "stdout": "", "stderr": ""},
+                "command_executed": True,
+                "verification": {"required": True, "status": "verified",
+                                 "command": "python -m py_compile fibonacci.py"},
+                "commands": [{
+                    "command": "python -m py_compile fibonacci.py",
+                    "exit_code": 0, "stdout": "", "stderr": "",
+                    "timed_out": False, "state_version": 1,
+                }],
+                "state_version": 1,
+                "last_edit_state_version": 0,
+            }
+        },
+    )
+
+    class _SpecMaster(_Master):
+        def __init__(self, r):
+            self.registry = _CodingRegistry(_Specialist(r))
+
+        def _capability_plan(self, request):
+            return [{"agent": "coding_agent", "capability": "code_debugging"}]
+
+    state = await run_task_graph(_SpecMaster(result), "fix the error in fibonacci.py",
+                                 workspace_root=".", max_task_retries=0)
+    final = state.get("final_answer", "")
+    # Must not be the raw JSON blob
+    assert "operation" not in final or "{" not in final[:5], \
+        f"final_answer still contains raw JSON: {final[:200]}"
+    # Must mention the changed file or a change-related keyword
+    assert any(kw in final.lower() for kw in ("fibonacci", "modified", "created", "completed", "produced")), \
+        f"final_answer should reference the file change: {final}"
