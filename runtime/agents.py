@@ -34,6 +34,7 @@ from runtime.self_healing import classify_failure
 from tools.vision import VisionPreprocessor
 from runtime.prompts import agentic_loop_prompt, document_prompt, handoff_prompt, planning_prompt, specialist_prompt
 from runtime.lightweight_router import LightweightTaskRouter, LightweightClassificationError, TaskClassification
+from routing.adaptive_router import ContextualBanditRouter, RoutingCandidate
 
 
 class AgentStatus(str, Enum):
@@ -1183,7 +1184,9 @@ class MasterAgent:
                  max_subagent_calls: int = 8, max_depth: int = 2, total_timeout_seconds: float = 360.0,
                  trace: list[dict[str, Any]] | None = None,
                  progress_callback: Callable[[dict[str, Any]], None] | None = None,
-                 capability_matcher: CapabilityMatcher | None = None) -> None:
+                 capability_matcher: CapabilityMatcher | None = None,
+                 adaptive_router: ContextualBanditRouter | None = None,
+                 routing_mode: str = "shadow") -> None:
         self.registry, self.master_provider, self.planner, self.verifier = registry, master_provider, planner, verifier
         self.lightweight_router_provider = lightweight_router_provider
         self.model_call_callback: Callable[..., Any] | None = None
@@ -1198,6 +1201,8 @@ class MasterAgent:
         self.total_timeout_seconds = max(1.0, total_timeout_seconds)
         self.trace = trace if trace is not None else []
         self.progress_callback = progress_callback
+        self.adaptive_router = adaptive_router
+        self.routing_mode = routing_mode if routing_mode in {"shadow", "adaptive"} else "shadow"
         self.capability_matcher = capability_matcher or CapabilityMatcher([
             CapabilityProfile("document_creation", "create new documents and save DOCX, PDF, Markdown, or TXT artifacts", "document_agent", "document", ("docx", "pdf", "markdown", "md", "txt")),
             CapabilityProfile("document_analysis", "inspect PDFs, reports, OCR text, and extract findings", "document_agent", "document", ("json", "docx")),
@@ -1215,9 +1220,62 @@ class MasterAgent:
         loop.
         """
         plan = self._capability_plan(request)
+        if self.adaptive_router and plan:
+            baseline_item = plan[0]
+            candidates = self._routing_candidates(request, baseline_item)
+            baseline = next((candidate for candidate in candidates if candidate.name == baseline_item.get("agent")), candidates[0])
+            baseline_capability = str(baseline_item.get("capability", ""))
+            routing_context = {
+                "task_type": "psu_approval_note" if baseline_capability == "psu_approval_note" else
+                             "document" if re.search(r"pdf|report|document|ocr", request.lower()) else
+                             "vision" if re.search(r"p&id|diagram|image|visual", request.lower()) else
+                             "coding" if re.search(r"python|code|script|pytest|function", request.lower()) else "general",
+                "required_capabilities": baseline_item.get("capability", "reasoning"),
+                "quality_required": 0.80,
+                "compound": bool(re.search(r"\band\b|\bthen\b|calculate|draft", request.lower())),
+            }
+            decision = self.adaptive_router.select(routing_context, candidates, baseline, mode=self.routing_mode)
+            if self.routing_mode == "adaptive" and decision.mode == "adaptive" and not decision.fallback:
+                selected = decision.selected
+                plan[0] = {**baseline_item, "agent": selected.name,
+                           "capability": selected.workflow or baseline_item.get("capability", "reasoning"),
+                           "routing_source": "linucb"}
+            plan[0].update({"routing_mode": decision.mode, "bandit_decision": decision.to_dict(),
+                            "routing_context": routing_context,
+                            "eligible_candidates": [candidate.to_dict() for candidate in decision.eligible_candidates],
+                            "adaptive_fallback": decision.fallback})
         for item in plan:
             item.setdefault("routing_source", "master_agent")
         return plan
+
+    def _routing_candidates(self, request: str, baseline: dict[str, Any]) -> list[RoutingCandidate]:
+        """Build only capability-compatible specialist candidates."""
+        text = request.lower()
+        candidates: list[RoutingCandidate] = []
+        for name in ("document_agent", "vision_agent", "coding_agent", "general_agent"):
+            try:
+                descriptor = self.registry.get(name).descriptor
+            except Exception:
+                continue
+            compatible = True
+            if baseline.get("capability") == "psu_approval_note":
+                compatible = name == "document_agent"
+            elif re.search(r"p&id|diagram|visual|image", text):
+                compatible = name in {"vision_agent", "document_agent"}
+            elif re.search(r"python|code|script|pytest|function", text):
+                compatible = name == "coding_agent"
+            elif re.search(r"pdf|report|document|ocr", text):
+                compatible = name in {"document_agent", "vision_agent"}
+            if compatible:
+                capabilities = {getattr(value, "value", str(value)) for value in descriptor.capabilities}
+                candidates.append(RoutingCandidate(name=name, model=descriptor.provider_name,
+                                                    capabilities=frozenset(capabilities), quality=1.0,
+                                                    workflow=baseline.get("capability", "reasoning")))
+        if not candidates:
+            candidates.append(RoutingCandidate(name=str(baseline.get("agent", "general_agent")),
+                                                model=str(baseline.get("agent", "general_agent")), quality=1.0,
+                                                workflow=baseline.get("capability", "reasoning")))
+        return candidates
 
     def _event(self, event: str, state: MasterTaskState, **meta: Any) -> None:
         self.trace.append({"event": event, "trace_id": state.trace_id,
@@ -1230,6 +1288,12 @@ class MasterAgent:
     def _capability_plan(self, request: str) -> list[dict[str, Any]]:
         """Master-owned capability selection used when model planning is unavailable."""
         text = request.lower()
+        if re.search(r"\b(what\s+is|explain|define)\b", text) and re.search(
+            r"\b(refinery\s+approval\s+note|psu\s+approval\s+note|office\s+note)\b", text
+        ):
+            return [{"agent": "document_agent", "task": request,
+                     "capability": "psu_approval_note",
+                     "success_criteria": ["grounded administrative approval-note explanation"]}]
         output_match = re.search(r"\b(docx|word document|microsoft word|pdf|markdown|md|txt)\b", text)
         output = output_match.group(1) if output_match else None
         modality = "image" if re.search(r"\b(image|p&id|diagram|visual)\b", text) else "document" if re.search(r"\b(pdf|document|report|ocr|markdown|md|txt)\b", text) else None

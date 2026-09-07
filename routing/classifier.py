@@ -36,6 +36,12 @@ class TaskType(str, Enum):
     ARTIFACT_GENERATION = "artifact_generation"
 
 
+class DomainIntent(str, Enum):
+    GENERAL = "general"
+    PSU_APPROVAL_NOTE = "psu_approval_note"
+    PRODUCT_OPERATIONS = "product_operations"
+
+
 class Modality(str, Enum):
     TEXT = "text"
     IMAGE = "image"
@@ -76,6 +82,11 @@ class Task(BaseModel):
     requires_documents: bool = False
     requires_tools: list[str] = Field(default_factory=list)
     requires_human_approval: bool = False
+    required_capabilities: list[str] = Field(default_factory=list)
+    quality_required: float = 0.80
+    domain_intent: DomainIntent = DomainIntent.GENERAL
+    interpretation_candidates: list[str] = Field(default_factory=list)
+    workflow: str = "general_reasoning"
     attached_files: list[str] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
@@ -460,6 +471,7 @@ class TaskClassifier:
             )
 
         task_type = self._detect_task_type(req.lower(), modality)
+        domain_intent, candidates, workflow = self._detect_domain_intent(req.lower())
 
         # NEW: continuity fallback. Only overrides GENERAL, only when the message
         # is short and carries no strong signal of its own, and only pulls toward
@@ -510,8 +522,14 @@ class TaskClassifier:
             requires_documents=requires_documents, requires_tools=required_tools,
             requires_human_approval=(
                 task_type == TaskType.ARTIFACT_GENERATION
-                or _matches_any(req.lower(), _ARTIFACT_PATTERNS)
+                or (
+                    _matches_any(req.lower(), _ARTIFACT_PATTERNS)
+                    and not bool(re.search(r"\b(what\s+is|explain|define|describe)\b", req, re.I))
+                )
             ),
+            required_capabilities=self._required_capabilities(task_type, modality, attached_files, req.lower()),
+            domain_intent=domain_intent, interpretation_candidates=candidates,
+            workflow=workflow,
             attached_files=attached_files,
         )
        
@@ -532,13 +550,38 @@ class TaskClassifier:
         if has_docs:
             return Modality.DOCUMENT
         # Fall back to text cues (no files attached)
+        if re.search(r"\b(scanned|scan|inspection\s+report|report)\b", req, re.I) and _matches_any(req, _DOCUMENT_PATTERNS):
+            return Modality.DOCUMENT
         if _matches_any(req, _VISION_PATTERNS):
             return Modality.IMAGE
         if _matches_any(req, _DOCUMENT_PATTERNS):
             return Modality.DOCUMENT
         return Modality.TEXT
 
+    @staticmethod
+    def _detect_domain_intent(req: str) -> tuple[DomainIntent, list[str], str]:
+        approval = bool(re.search(r"\b(approval\s+note|office\s+note|administrative\s+approval)\b", req))
+        product = bool(re.search(r"\b(diesel|petrol|product|shipment|ship|dispatch|quantity|batch|tanker|cargo)\b", req))
+        psu = bool(re.search(r"\b(mrpl|psu|delegation\s+of\s+power|dop|financial\s+implication|proposal|recommendation|pipeline|valve|refinery\s+work)\b", req))
+        if approval and product and not psu:
+            return DomainIntent.PRODUCT_OPERATIONS, [DomainIntent.PRODUCT_OPERATIONS.value], "product_operations"
+        # In the MRPL workflow an unqualified approval note is an
+        # administrative PSU note by default. Product/shipment language remains
+        # the explicit disambiguator for transaction operations.
+        if approval and (psu or "refinery" in req or not product):
+            candidates = [DomainIntent.PSU_APPROVAL_NOTE.value]
+            if product:
+                candidates.append(DomainIntent.PRODUCT_OPERATIONS.value)
+            return DomainIntent.PSU_APPROVAL_NOTE, candidates, "psu_approval_note_explain" if re.search(r"\b(what\s+is|explain|define)\b", req) else "psu_approval_note_generate"
+        if product:
+            return DomainIntent.PRODUCT_OPERATIONS, [DomainIntent.PRODUCT_OPERATIONS.value], "product_operations"
+        return DomainIntent.GENERAL, [], "general_reasoning"
+
     def _detect_task_type(self, req: str, modality: Modality) -> TaskType:
+        # Engineering drawings are a domain-specific document workflow even
+        # when the generic vision cues also match (for example, P&ID).
+        if _matches_any(req, _ENGINEERING_PATTERNS):
+            return TaskType.ENGINEERING_DOCUMENT
         # If image is detected, it is an image analysis or multimodal task
         if modality == Modality.IMAGE:
             return TaskType.IMAGE_ANALYSIS
@@ -557,8 +600,6 @@ class TaskClassifier:
             return TaskType.GENERAL
 
         # More specific patterns first
-        if _matches_any(req, _ENGINEERING_PATTERNS):
-            return TaskType.ENGINEERING_DOCUMENT
         if _matches_any(req, _DEBUGGING_PATTERNS):
             return TaskType.DEBUGGING
         if _matches_any(req, _CODING_PATTERNS):
@@ -612,6 +653,26 @@ class TaskClassifier:
         if task_type == TaskType.ARTIFACT_GENERATION:
             tools.append("artifact_generator")
         return tools
+
+    @staticmethod
+    def _required_capabilities(task_type: TaskType, modality: Modality,
+                               files: list[str], req: str = "") -> list[str]:
+        caps: list[str] = []
+        if modality in (Modality.IMAGE, Modality.MULTIMODAL):
+            caps.append("vision")
+        if modality == Modality.DOCUMENT or task_type == TaskType.DOCUMENT_ANALYSIS:
+            caps.extend(["ocr", "layout_extraction"] if any(Path(f).suffix.lower() == ".pdf" for f in files) or re.search(r"\b(scanned|scan|ocr)\b", req) else ["document_analysis"])
+        if task_type in (TaskType.CODING, TaskType.DEBUGGING):
+            caps.append("coding")
+        if task_type in (TaskType.ENGINEERING_DOCUMENT, TaskType.IMAGE_ANALYSIS):
+            caps.append("reasoning")
+        if task_type == TaskType.ENGINEERING_DOCUMENT:
+            caps.append("vision")
+        if re.search(r"\b(calculate|calculation|remaining\s+life|corrosion\s+rate)\b", req):
+            caps.append("calculation")
+        if not caps:
+            caps.append("calculation" if task_type == TaskType.CALCULATION else "reasoning")
+        return list(dict.fromkeys(caps))
 
 
 # ---------------------------------------------------------------------------

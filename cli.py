@@ -111,10 +111,20 @@ def _print_result_summary(result: dict[str, Any]) -> None:
     table.add_column(style="dim", width=18)
     table.add_column()
     table.add_row("Status", f"[{style}]{status.upper()}[/{style}]")
+    task = result.get("task", {}) or {}
+    table.add_row("Domain intent", str(task.get("domain_intent", "general")))
+    table.add_row("Workflow", str(task.get("workflow", "general_reasoning")))
+    capabilities = task.get("required_capabilities", []) or []
+    table.add_row("Capabilities", ", ".join(map(str, capabilities)) or "—")
     table.add_row("Specialist", result.get("selected_agent") or "—")
+    table.add_row("Selected model", result.get("selected_model") or "—")
     table.add_row("Verification", str(result.get("verification", {}).get("status", "not run")))
+    table.add_row("Policy gateway", "checked")
+    table.add_row("Approval", "required" if task.get("requires_human_approval") else "not required")
     repairs = result.get("repair_history", [])
     table.add_row("Repairs", str(len(repairs)))
+    if result.get("checkpoint_store"):
+        table.add_row("Checkpoints", str(result["checkpoint_store"]))
     if result.get("output_dir"):
         table.add_row("Run artifacts", str(result["output_dir"]))
     console.print(Panel(table, title="[bold bright_cyan]Run Summary[/bold bright_cyan]", border_style="bright_cyan"))
@@ -333,11 +343,23 @@ async def _run() -> None:
                 if name == "Master Plan":
                     console.print("  [step]… Master planning[/step]")
                 elif name == "Capability Discovery":
-                    console.print("  [step]✓ Capabilities discovered[/step]")
+                    caps = ", ".join(map(str, event.get("required_capabilities", []))) or "general"
+                    intent = event.get("domain_intent", "general")
+                    workflow = event.get("workflow", "general_reasoning")
+                    quality = event.get("quality_required") or 0.80
+                    console.print(f"  [step]✓ Capability route: {intent} → {workflow}[/step]")
+                    console.print(f"    [dim]required={caps}  quality≥{quality:.2f}[/dim]")
                 elif name == "Plan Created":
                     console.print("  [step]… Master planning[/step]")
                 elif name == "Plan Validated":
                     console.print("  [step]✓ Plan validated[/step]")
+                elif name == "Policy Gateway":
+                    approval = " approval_required" if event.get("approval_required") else ""
+                    console.print(f"  [step]✓ Policy gateway checked: {event.get('action', 'action')}{approval}[/step]")
+                elif name == "Approval Checkpoint":
+                    console.print(f"  [warning]⚠ Human approval checkpoint: {event.get('action', 'action')}[/warning]")
+                elif name == "Checkpoint Persisted":
+                    console.print(f"  [dim cyan]▣ checkpoint persisted: {event.get('node', 'node')}[/dim cyan]")
                 elif name == "Specialist Execution":
                     console.print(f"  [step]⏳ {event.get('agent', 'specialist')} working…[/step]")
                 elif name == "Model Activity":

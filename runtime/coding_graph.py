@@ -15,6 +15,7 @@ from langgraph.graph import END, START, StateGraph
 
 from runtime.actions import ActionParseError, parse_action
 from runtime.task_state import StepStatus
+from runtime.tool_policy import ApprovalRequired
 from runtime.verification import verify_tool_result, verify_plan
 from runtime.prompts import SYSTEM_PROMPT
 
@@ -64,7 +65,9 @@ def _event(kind: str, **data: Any) -> dict[str, Any]:
 
 def build_coding_graph(provider: Any, tool_registry: Any, *, allowed_tools: set[str] | None = None,
                        max_iterations: int = 20, max_invalid_actions: int = 3,
-                       on_model_call: Any | None = None, on_tool_call: Any | None = None):
+                       on_model_call: Any | None = None, on_tool_call: Any | None = None,
+                       policy_engine: Any | None = None,
+                       approval_callback: Any | None = None):
     """Build a compiled reason → validate → execute → record graph."""
     names = set(allowed_tools or tool_registry.list_names())
 
@@ -133,9 +136,19 @@ def build_coding_graph(provider: Any, tool_registry: Any, *, allowed_tools: set[
         if on_tool_call:
             on_tool_call()
         try:
-            result = await tool_registry.get(name).ainvoke(args)
+            if policy_engine is not None:
+                result = await policy_engine.execute(
+                    tool_registry, name, args,
+                    task_id=str(state.get("run_id") or state.get("original_request", "")),
+                    approve=approval_callback,
+                )
+            else:
+                result = await tool_registry.get(name).ainvoke(args)
             if not isinstance(result, dict):
                 result = {"ok": True, "result": str(result)}
+        except ApprovalRequired as exc:
+            result = {"ok": False, "tool": name, "error": "approval_denied",
+                      "approval": "denied", "message": str(exc)[:300]}
         except Exception as exc:
             result = {"ok": False, "tool": name, "error": type(exc).__name__, "message": str(exc)[:300]}
         result = dict(result)
@@ -154,6 +167,8 @@ def build_coding_graph(provider: Any, tool_registry: Any, *, allowed_tools: set[
         approval = None
         if name in {"edit_file", "create_file", "create_python_script"}:
             approval = "approved" if result.get("ok", True) else ("denied" if result.get("error") == "approval_denied" else None)
+        elif name == "execute_command" and result.get("approval"):
+            approval = result.get("approval")
         events = [_event(
                 "tool_result", tool=name, arguments=trace_args,
                 result=result_text[:12000], result_size=len(result_text.encode("utf-8")),
@@ -173,7 +188,13 @@ def build_coding_graph(provider: Any, tool_registry: Any, *, allowed_tools: set[
             if read_tool is not None and args.get("path"):
                 verify_started = time.perf_counter()
                 try:
-                    verify = await read_tool.ainvoke({"path": args["path"]})
+                    if policy_engine is not None:
+                        verify = await policy_engine.execute(
+                            tool_registry, "read_file", {"path": args["path"]},
+                            task_id=str(state.get("run_id") or state.get("original_request", "")),
+                        )
+                    else:
+                        verify = await read_tool.ainvoke({"path": args["path"]})
                     verify_ok = isinstance(verify, dict) and verify.get("ok", False)
                     verify_payload = verify if isinstance(verify, dict) else {"result": str(verify)}
                     verify_content = str(verify_payload.get("content", ""))
@@ -308,10 +329,13 @@ async def run_coding_graph(provider: Any, tool_registry: Any, request: str, *, a
                            encoded_images: list[str] | None = None,
                            max_iterations: int = 20, max_invalid_actions: int = 3,
                            on_model_call: Any | None = None, on_tool_call: Any | None = None,
-                           max_tool_calls: int = 40, max_mutations: int = 10) -> CodingState:
+                           max_tool_calls: int = 40, max_mutations: int = 10,
+                           policy_engine: Any | None = None,
+                           approval_callback: Any | None = None) -> CodingState:
     graph = build_coding_graph(provider, tool_registry, allowed_tools=allowed_tools,
                                max_iterations=max_iterations, max_invalid_actions=max_invalid_actions,
-                               on_model_call=on_model_call, on_tool_call=on_tool_call)
+                               on_model_call=on_model_call, on_tool_call=on_tool_call,
+                               policy_engine=policy_engine, approval_callback=approval_callback)
     return await graph.ainvoke({"user_request": request, "original_request": request,
                                 "normalized_request": request, "status": "planned",
                                 "messages": messages or [HumanMessage(content=request)],

@@ -130,3 +130,17 @@ async def test_coding_success_without_execution_evidence_cannot_verify():
     state = await run_task_graph(master, "fix the failing tests and run pytest", workspace_root=".", max_task_retries=0)
     assert state["status"] == "failed"
     assert state["verification"]["passed"] is False
+
+
+@pytest.mark.asyncio
+async def test_verified_file_change_overrides_contradictory_model_summary():
+    result = AgentResult(
+        agent="coding_agent", status=AgentStatus.SUCCESS,
+        summary="Insufficient evidence to proceed.",
+        changes=["doubly_linked_list.py"],
+        verification={"required": True, "status": "verified"},
+        metadata={"coding_state": {"verification": {"status": "verified"}, "changes": ["doubly_linked_list.py"], "evidence": ["repository_context:19 files under workspace", "syntax_validation:doubly_linked_list.py:passed"]}},
+    )
+    state = await run_task_graph(_CodingSuccessWithoutEvidence(result), "create a py file on doubly linked list", workspace_root=".", max_task_retries=0)
+    assert state["status"] == "completed"
+    assert state["final_answer"] == "Created and verified: doubly_linked_list.py"

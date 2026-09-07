@@ -311,11 +311,13 @@ def _extract_findings_deterministic(
     if not site:
         uncertainties.append("Site/location could not be extracted from OCR text")
 
-    # Check for low-confidence OCR regions
-    low_conf_blocks = [b for b in blocks if b.confidence < 0.5]
+    # Check for low-confidence OCR regions. Values below the review threshold
+    # remain usable evidence but are explicitly queued for human confirmation.
+    review_threshold = 0.85
+    low_conf_blocks = [b for b in blocks if b.confidence < review_threshold]
     if low_conf_blocks:
         uncertainties.append(
-            f"{len(low_conf_blocks)} OCR regions had confidence < 0.5 — text may be unreliable"
+            f"{len(low_conf_blocks)} OCR regions had confidence < {review_threshold:.2f} — human review required"
         )
         missing_info.append(
             f"Low-confidence OCR text on pages: {sorted(set(b.page_number for b in low_conf_blocks))}"
@@ -333,6 +335,13 @@ def _extract_findings_deterministic(
             "inspector": inspector,
             "source_file": str(source_path.name),
             "extraction_method": "deterministic_ocr",
+            "confidence_threshold": review_threshold,
+            "review_required": bool(low_conf_blocks),
+            "review_queue": [
+                {"value": b.text, "confidence": b.confidence, "page": b.page_number,
+                 "bounding_box": b.bounding_box, "source": str(source_path)}
+                for b in low_conf_blocks
+            ],
             "extraction_timestamp": datetime.now(timezone.utc).isoformat(),
         },
         "findings": findings,

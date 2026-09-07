@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
 py-modules = ["cli"]
-packages = ["app", "app.api", "models", "routing", "runtime", "tools", "tools.ocr", "security", "storage", "pipeline"]
+packages = ["app", "app.api", "models", "routing", "runtime", "tools", "tools.ocr", "security", "storage", "pipeline", "evaluation"]
 
 [project]
 name = "sih-workbench"

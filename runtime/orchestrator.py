@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any, AsyncIterator
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_core.tools import tool
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
@@ -34,6 +35,8 @@ from runtime.coding_graph import run_coding_graph
 from runtime.task_graph import run_task_graph
 from runtime.approvals import ApprovalManager
 from storage.outputs import OutputStore
+from storage.graph_state import SQLiteGraphStateStore
+from storage.telemetry import SQLiteTelemetryStore
 from security.audit import AuditLogger
 from security.network import NetworkMonitor
 from tools.calculator import calculator
@@ -47,6 +50,11 @@ from tools.permissions import AccessMode, SessionPermissions
 from tools.registry import ToolRegistry
 from tools.mcp_adapter import AegisMCPAdapter
 from runtime.prompts import SYSTEM_PROMPT, TOOL_LOOP_PROMPT
+from runtime.tool_policy import PolicyDenied, build_policy_engine
+from runtime.official_documents import OfficialDocumentWorkflow
+from routing.approval_note import ApprovalNote
+from routing.adaptive_router import ContextualBanditRouter, SQLiteBanditStore
+from evaluation.routing import reward_for_outcome
 
 _SYSTEM_PROMPT = SYSTEM_PROMPT
 _TOOL_LOOP_PROMPT = TOOL_LOOP_PROMPT
@@ -80,6 +88,17 @@ class Orchestrator:
         self.availability = availability
         self.output_store = output_store or OutputStore()
         self.workspace_root = Path(workspace_root or self.output_store.workspace_dir).resolve()
+        self.graph_state_store = SQLiteGraphStateStore(self.workspace_root / ".aegis" / "runs.db")
+        self.telemetry_store = SQLiteTelemetryStore(self.workspace_root / ".aegis" / "runs.db")
+        self.adaptive_router = ContextualBanditRouter(
+            store=SQLiteBanditStore(self.workspace_root / ".aegis" / "runs.db")
+        )
+        self.routing_mode = os.getenv("AEGIS_ROUTING_MODE", "shadow").strip().lower()
+        if self.routing_mode not in {"shadow", "adaptive"}:
+            self.routing_mode = "shadow"
+        self.official_documents = OfficialDocumentWorkflow(
+            self.output_store.artifacts_dir,
+        )
         self.approvals = approvals or ApprovalManager()
         self.max_iterations = min(20, max(1, max_iterations))
         self._session_task_type: dict[str, str] = {}   # NEW: thread_id -> last task_type
@@ -100,12 +119,31 @@ class Orchestrator:
             vision_provider = None
         self.vision_runtime = VisionRuntime(self.output_store.workspace_dir, vision_provider)
         self.tool_registry = self._build_tool_registry()
+        self.policy_engine = build_policy_engine(
+            self.tool_registry,
+            self.workspace_root,
+            approval_requester=self._policy_approval,
+            audit=self.audit.log,
+        )
+        # These deterministic file tools predate ToolMeta permissions, so make
+        # their side-effect policy explicit at the gateway boundary.
+        for name in ("write_file", "create_directory"):
+            policy = self.policy_engine.policy_for(name)
+            if policy:
+                from runtime.tool_policy import ToolPolicy
+                self.policy_engine.register(ToolPolicy(
+                    name=name, filesystem="workspace_only", requires_approval=True,
+                    timeout=policy.timeout, max_output=policy.max_output,
+                ))
+        from runtime.tool_policy import ToolPolicy
+        self.policy_engine.register(ToolPolicy(
+            name="write_official_document", filesystem="deliverables_only",
+            requires_approval=True, max_output=20_000,
+        ))
         self.mcp_adapter = AegisMCPAdapter(self.tool_registry)
         # Additive capability-driven workflow seam; existing graph remains the
         # backwards-compatible default during migration.
-        self.agent_registry = build_default_agent_registry(
-            registry,
-            tools={
+        specialist_tools = {
                 "read_file": self.workspace_tools.read_file,
                 "list_directory": self.workspace_tools.list_directory,
                 "tree": self.workspace_tools.tree,
@@ -127,7 +165,10 @@ class Orchestrator:
                 "read_document_section": self.document_tools.read_document_section,
                 "analyze_image": self.vision_runtime.analyze_image,
                 "compare_images": self.vision_runtime.compare_images,
-            },
+            }
+        self.agent_registry = build_default_agent_registry(
+            registry,
+            tools=self.policy_engine.wrap_callables(specialist_tools),
         )
         try:
             master_provider = registry.get_provider("qwen-general")
@@ -136,6 +177,8 @@ class Orchestrator:
         self.master_agent = MasterAgent(
             self.agent_registry,
             master_provider=master_provider,
+            adaptive_router=self.adaptive_router,
+            routing_mode=self.routing_mode,
         )
         self.master_agent.model_call_callback = self.network.record_model_call
         for specialist in self.agent_registry._agents.values():
@@ -144,6 +187,13 @@ class Orchestrator:
             if hasattr(specialist, "tool_call_callback"):
                 specialist.tool_call_callback = self.network.record_tool_call
         self.graph = self._build_graph()
+
+    def enable_adaptive_routing(self, adaptive_report: dict[str, Any], baseline_report: dict[str, Any]) -> dict[str, Any]:
+        """Enable adaptive selection only after the full non-inferiority gate."""
+        self.adaptive_router.enable_after_evaluation(adaptive_report, baseline=baseline_report)
+        self.routing_mode = "adaptive"
+        self.master_agent.routing_mode = "adaptive"
+        return {"enabled": True, "mode": "adaptive"}
 
     @staticmethod
     def _run_document_pipeline(input_path: str) -> dict[str, Any]:
@@ -169,6 +219,8 @@ class Orchestrator:
         previous_callback = self.master_agent.progress_callback
         self.master_agent.progress_callback = progress_callback
         previous_command_callback = getattr(self.workspace_tools, "command_event_callback", None)
+        run_id = self.output_store.new_run_id()
+        started = time.perf_counter()
         self.workspace_tools.command_event_callback = progress_callback
         try:
             graph_state = await run_task_graph(
@@ -178,13 +230,15 @@ class Orchestrator:
                 progress_callback=progress_callback,
                 max_task_retries=1,
                 request_context=request_context,
+                state_store=self.graph_state_store,
+                run_id=run_id,
             )
         finally:
             self.master_agent.progress_callback = previous_callback
             self.workspace_tools.command_event_callback = previous_command_callback
-        run_id = self.output_store.new_run_id()
         result_items = graph_state.get("step_results", [])
         status = "success" if graph_state.get("status") == "completed" else "failure"
+        task_data = graph_state.get("task", {}) or {}
         selected_model_role = graph_state.get("selected_model", "")
         selected_model_id = ""
         if selected_model_role:
@@ -192,13 +246,59 @@ class Orchestrator:
                 selected_model_id = self.registry.get_provider(selected_model_role).model_id
             except (KeyError, AttributeError):
                 selected_model_id = str(selected_model_role)
+        eligible_candidates = task_data.get("eligible_candidates", []) or []
+        alternative_models = [str(candidate.get("model")) for candidate in eligible_candidates
+                              if isinstance(candidate, dict) and candidate.get("model")
+                              and str(candidate.get("model")) != str(selected_model_role)]
         network_report = self.network.report()
+        telemetry = self.telemetry_store.record(
+            run_id=run_id, task_type=str(task_data.get("domain_intent") or task_data.get("operation") or "general"),
+            required_capabilities=list(task_data.get("required_capabilities", []) or []),
+            selected_model=str(selected_model_role),
+            alternative_models=alternative_models,
+            latency_ms=(time.perf_counter() - started) * 1000,
+            token_count=int(graph_state.get("token_count", 0) or 0),
+            tool_calls=int(graph_state.get("tool_call_count", 0) or 0),
+            tool_failures=len(graph_state.get("errors", []) or []),
+            verification_result=bool(graph_state.get("verification", {}).get("passed")),
+            human_approval=bool(task_data.get("requires_human_approval")),
+            final_success=graph_state.get("status") == "completed",
+            metadata={"workflow": task_data.get("workflow", "general_reasoning"),
+                      "routing": task_data.get("routing", {})},
+            routing_context=task_data.get("routing_context", {}),
+            eligible_candidates=task_data.get("eligible_candidates", []),
+            selected_workflow=str(task_data.get("workflow", "general_reasoning")),
+            routing_mode=str(task_data.get("routing_mode", self.routing_mode)),
+            adaptive_fallback=bool(task_data.get("adaptive_fallback", False)),
+            escalation=bool(graph_state.get("escalation_level", 0)),
+            reward=reward_for_outcome(
+                success=graph_state.get("status") == "completed",
+                verification=bool(graph_state.get("verification", {}).get("passed")),
+                evidence_quality=1.0 if graph_state.get("verification", {}).get("passed") else 0.0,
+                human_accepted=not bool(task_data.get("requires_human_approval")) or bool(graph_state.get("approvals")),
+                latency_ms=(time.perf_counter() - started) * 1000,
+                failures=min(1.0, len(graph_state.get("errors", []) or []) / 5.0),
+                escalated=bool(graph_state.get("escalation_level", 0)),
+                unnecessary_escalation=bool(graph_state.get("escalation_level", 0)) and not bool(task_data.get("requires_human_approval")),
+            ),
+        )
+        decision = task_data.get("bandit_decision")
+        if isinstance(decision, dict):
+            self.adaptive_router.record_observed_outcome(
+                decision, task_data.get("routing_context", {}), telemetry["reward"],
+                latency_ms=telemetry["latency_ms"],
+                success=telemetry["final_success"],
+                verification=telemetry["verification_result"],
+                invalid=bool(telemetry["security_violations"] or telemetry["unauthorized_tool_executions"]
+                             or telemetry["approval_bypasses"]),
+            )
         metadata = {
             "run_id": run_id, "execution_mode": "master", "status": status,
             "task_type": "master", "modality": "text", "model": selected_model_id,
             "model_role": selected_model_role,
             "started_at": datetime.now(timezone.utc).isoformat(),
             "completed_at": datetime.now(timezone.utc).isoformat(),
+            "telemetry": telemetry,
         }
         trace = [{"timestamp": datetime.now(timezone.utc).isoformat(), "step": e.get("event", "master"),
                   "message": e.get("event", "master"), "metadata": e} for e in graph_state.get("trace", [])]
@@ -223,6 +323,11 @@ class Orchestrator:
             "repair_history": graph_state.get("repair_history", []),
             "selected_agent": graph_state.get("selected_agent", ""),
             "selected_model": graph_state.get("selected_model", ""),
+            "task": graph_state.get("task", {}),
+            "routing": graph_state.get("routing", {}),
+            "checkpoint_store": str(self.workspace_root / ".aegis" / "runs.db"),
+            "checkpoint_ref": graph_state.get("checkpoint_ref", ""),
+            "telemetry": telemetry,
             "network_report": network_report,
             "trace": trace,
         }
@@ -257,7 +362,31 @@ class Orchestrator:
             reg.register(document_tool, tags=["document", "local", "read_only"])
         for vision_tool in self.vision_runtime.as_langchain_tools():
             reg.register(vision_tool, tags=["vision", "local", "read_only"])
+        reg.register(self._official_document_tool(), requires_approval=True,
+                     tags=["document", "official", "approval"],
+                     permissions={"read": False, "write": True, "delete": False,
+                                  "network": False, "external_side_effect": False,
+                                  "credential_access": False, "system_access": False},
+                     reversible=False)
         return reg
+
+    def _official_document_tool(self):
+        workflow = self.official_documents
+
+        @tool("write_official_document")
+        def write_official_document(subject: str, background: str, proposal: str,
+                                    financial_implication: str, dop_authority: str,
+                                    recommendation: str, filename: str = "official_approval_note.docx") -> dict[str, Any]:
+            """Generate an official approval DOCX after the policy gate approves it."""
+            note = ApprovalNote(subject=subject, background=background, proposal=proposal,
+                                financial_implication=financial_implication,
+                                dop_authority=dop_authority, recommendation=recommendation)
+            state = workflow.prepare(note)
+            # The surrounding PolicyEngine is the human gate. Reaching this
+            # callable means that gate has already approved the action.
+            return workflow.generate(note, request_id=state.request_id, approve=True, filename=filename)
+
+        return write_official_document
 
     def _request_filesystem_permission(self, mode: AccessMode, path: Path, reason: str) -> bool:
         """Ask in the terminal; grants are held only by this Orchestrator instance."""
@@ -270,6 +399,9 @@ class Orchestrator:
 
     def _edit_approver(self, action: str, path: str, old_text: str = "", new_text: str = "") -> bool:
         """Bounded interactive approval for workspace file mutations."""
+        from runtime.tool_policy import policy_approval_granted
+        if policy_approval_granted():
+            return True
         if self._approval_fn is not None:
             return bool(self._approval_fn(action, path, old_text, new_text))
         action_name = f"{action} {path}"
@@ -286,6 +418,9 @@ class Orchestrator:
 
     def _command_approver(self, action: str, command: str, cwd: str = ".") -> bool:
         """Bounded interactive approval for execute_command. Shows command and cwd."""
+        from runtime.tool_policy import policy_approval_granted
+        if policy_approval_granted():
+            return True
         if self._approval_fn is not None:
             return bool(self._approval_fn(action, command, cwd))
         action_name = f"execute_command in '{cwd}'"
@@ -298,6 +433,31 @@ class Orchestrator:
             metadata={"command": command[:200], "cwd": cwd},
         )
         return approved
+
+    def _policy_approval(self, request_id: str, tool: str, details: str) -> bool:
+        """Human checkpoint used by the policy gateway, separate from retries."""
+        if self._approval_fn is not None:
+            return bool(self._approval_fn(tool, details))
+        action = tool
+        if tool in {"edit_file", "create_file", "create_python_script"}:
+            match = re.search(r"(?:path|file_path)=([^,]+)", details)
+            if match:
+                action = f"{tool} {match.group(1)}"
+        return self.approvals.prompt_terminal(request_id, action, details)
+
+    def _legacy_tool_approval(self, request_id: str, tool: str, details: str) -> bool:
+        """Adapt legacy workspace approvers behind the central policy gate."""
+        approver = getattr(self.workspace_tools, "approver", None)
+        command_approver = getattr(self.workspace_tools, "command_approver", None)
+        if tool in {"edit_file", "create_file", "create_python_script"} and approver:
+            path = re.search(r"(?:path|file_path)=([^,]+)", details)
+            content = re.search(r"content=([^,]+)", details)
+            return bool(approver(tool, path.group(1) if path else "", "", content.group(1) if content else ""))
+        if tool == "execute_command" and command_approver:
+            command = re.search(r"command=([^,]+)", details)
+            cwd = re.search(r"cwd=([^,]+)", details)
+            return bool(command_approver(tool, command.group(1) if command else "", cwd.group(1) if cwd else "."))
+        return self._policy_approval(request_id, tool, details)
 
     # -- Graph construction ---------------------------------------------
 
@@ -441,13 +601,14 @@ class Orchestrator:
         self.network.record_tool_call(tool=tool_name, local=True)
 
         try:
-            if tool_name == "read_file":
-                tool = read_file
-            elif tool_name == "write_file":
-                tool = write_file
-            else:
-                tool = self.tool_registry.get(tool_name)
-            tool_result = await tool.ainvoke(tool_args)
+            # All direct tool calls cross the same policy gateway as model
+            # tool calls.  The implementation remains in the registry.
+            override = read_file if tool_name == "read_file" else write_file if tool_name == "write_file" else None
+            tool_result = await self.policy_engine.execute(
+                self.tool_registry, tool_name, tool_args,
+                task_id=str(task_dict.get("id", "")),
+                tool_override=override,
+            )
             elapsed_ms = round((time.perf_counter() - t0) * 1000, 2)
 
             self.audit.log(
@@ -480,6 +641,15 @@ class Orchestrator:
                 ],
             }
 
+        except PolicyDenied as exc:
+            elapsed_ms = round((time.perf_counter() - t0) * 1000, 2)
+            error_msg = f"Tool '{tool_name}' blocked by policy: {exc}"
+            self.audit.log("tool_executed", task_id=task_dict.get("id"), tool=tool_name,
+                           status="policy_denied", error=str(exc), duration_ms=elapsed_ms)
+            return {"messages": [AIMessage(content=f"Error: {error_msg}")],
+                    "errors": [error_msg], "tool_ms": elapsed_ms,
+                    "current_step": "blocked", "trace": [make_trace_dict(
+                        step="policy", message=error_msg, duration_ms=elapsed_ms)]}
         except Exception as exc:
             elapsed_ms = round((time.perf_counter() - t0) * 1000, 2)
             error_msg = f"Tool '{tool_name}' execution error: {exc}"
@@ -532,6 +702,8 @@ class Orchestrator:
                 max_iterations=self.max_iterations,
                 on_model_call=lambda: self.network.record_model_call(model=provider.model_id, local=True),
                 on_tool_call=lambda: self.network.record_tool_call(tool="coding_graph", local=True),
+                policy_engine=self.policy_engine,
+                approval_callback=self._legacy_tool_approval,
             )
         except Exception as exc:
             yield {"kind": "error", "message": f"Coding graph error: {exc}"}
@@ -578,8 +750,19 @@ class Orchestrator:
                 continue
             try:
                 self.network.record_tool_call(tool=name, local=True)
-                output = await self.tool_registry.get(name).ainvoke(args)
+                output = await self.policy_engine.execute(
+                    self.tool_registry, name, args, task_id="tool_sequence"
+                )
                 results.append({"ok": True, "tool": name, "result": output})
+            except PolicyDenied as exc:
+                # Preserve the legacy explicit-sequence contract for an
+                # unknown registry name while retaining the policy decision
+                # and denial audit event. Registered tools still expose the
+                # canonical PolicyDenied failure to callers.
+                if name not in self.tool_registry.list_names():
+                    results.append({"ok": False, "tool": name, "error": "KeyError"})
+                else:
+                    results.append({"ok": False, "tool": name, "error": type(exc).__name__, "message": str(exc)})
             except Exception as exc:
                 results.append({"ok": False, "tool": name, "error": type(exc).__name__, "message": str(exc)})
         return results
