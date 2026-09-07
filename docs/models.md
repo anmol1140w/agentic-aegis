@@ -56,7 +56,7 @@ The `ModelRegistry` class loads configuration from `config/models.yaml`:
 models:
   qwen-general:
     provider: ollama
-    model: "qwen3:8b"
+    model: "qwen3.5:9b"
     capabilities:
       - general
       - reasoning

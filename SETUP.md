@@ -6,9 +6,14 @@ must be installed separately by the operator. No editable local path, virtual
 environment, wheelhouse, build directory, or generated workspace output
 should be committed or shared.
 
+The standard process sandbox works on all three platforms. Docker is optional
+and works wherever Docker Engine/Desktop is available. Bubblewrap is optional
+and Linux-only.
+
 ## 1. Prerequisites by platform
 
 Install Python 3.10 or newer (Python 3.12 is supported), Git, and Ollama.
+Python 3.11 or 3.12 is recommended for the broadest dependency wheel support.
 
 ### Linux (Ubuntu/Debian)
 
@@ -30,8 +35,9 @@ git --version
 ollama --version
 ```
 
-Install Poppler only if PDF rendering is required. Download a trusted Windows
-Poppler build, extract it, and add its `Library\bin` directory to `PATH`.
+Install Poppler only if PDF rendering through `pdf2image` is required. Download
+a trusted Windows Poppler build, extract it, and add its `Library\bin` directory
+to `PATH`. PyMuPDF is already included and is the preferred PDF path.
 
 ### macOS
 
@@ -59,19 +65,35 @@ python -m pip install --upgrade pip setuptools wheel
 python -m pip install -r requirements-dev.txt
 ```
 
-Alternatively, run `bash scripts/setup.sh`; it creates `.venv` and installs
-`requirements.txt`.
+The supported repeatable installer is:
+
+```bash
+bash scripts/setup.sh
+source .venv/bin/activate
+```
+
+It creates `.venv` and installs the editable package with development tools.
+To include the Docker Python SDK too, use
+`AEGIS_INSTALL_EXTRAS='dev,sandbox' bash scripts/setup.sh`.
 
 ### Windows PowerShell
 
 ```powershell
 git clone <repository-url> aegis
 Set-Location aegis
-py -3 -m venv .venv
+.\scripts\setup.ps1
 .\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip setuptools wheel
-python -m pip install -r requirements-dev.txt
 ```
+
+For Docker Python SDK support:
+
+```powershell
+.\scripts\setup.ps1 -Extras 'dev,sandbox'
+```
+
+Command Prompt users can run `scripts\setup.cmd` instead. It installs the
+standard development environment; use PowerShell when the Docker extra is
+needed.
 
 If PowerShell blocks activation for the current user, use the documented
 Python execution path without activation:
@@ -80,10 +102,12 @@ Python execution path without activation:
 .\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
 ```
 
-## 3. PaddleOCR CPU installation
+## 3. Optional OCR and PDF host dependencies
 
-If the default index cannot resolve the compatible PaddlePaddle CPU wheel,
-install PaddlePaddle from the official CPU index, then install PaddleOCR:
+The base package installs PaddleOCR and PaddlePaddle. If your platform or
+Python version cannot resolve the compatible PaddlePaddle CPU wheel, install
+the platform-specific wheel from the official CPU index, then install
+PaddleOCR:
 
 ```bash
 python -m pip install paddleocr==3.7.0
@@ -131,7 +155,45 @@ running.
 The application uses the local endpoint configured by the model registry; it
 does not require cloud API keys.
 
-## 5. Run the terminal client
+## 5. Optional execution sandboxes
+
+The default `process` backend needs no extra runtime. Check it with `/sandbox`
+after starting the CLI.
+
+For Docker:
+
+1. Install Docker Engine on Linux or Docker Desktop on macOS/Windows.
+2. Start the Docker daemon/Desktop application.
+3. Pull the image used by AEGIS:
+
+```bash
+docker pull python:3.12-slim
+AEGIS_SANDBOX_BACKEND=docker python cli.py
+```
+
+PowerShell:
+
+```powershell
+docker pull python:3.12-slim
+$env:AEGIS_SANDBOX_BACKEND = "docker"
+python cli.py
+```
+
+The image is not stored in Git and is not downloaded automatically. AEGIS
+returns `sandbox_unavailable` if Docker or the image is missing. The container
+has no network, drops capabilities, and mounts only the workspace read-write.
+
+For Bubblewrap, install `bwrap` from the Linux distribution packages and run:
+
+```bash
+sudo apt-get install -y bubblewrap   # Debian/Ubuntu
+AEGIS_SANDBOX_BACKEND=bwrap python cli.py
+```
+
+There is no Bubblewrap backend on native Windows or macOS; use the process or
+Docker backend there.
+
+## 6. Run the terminal client
 
 ```bash
 source .venv/bin/activate
@@ -210,7 +272,7 @@ Analyze workspace/fixtures/codex_multi_page_inspection.pdf
 
 Interactive commands include `/models`, `/network`, and `/quit`.
 
-## 6. Run the FastAPI service
+## 7. Run the FastAPI service
 
 In a second terminal:
 
@@ -247,7 +309,7 @@ curl -N http://127.0.0.1:8000/api/tasks/<execution_id>/events
 The service is intended for a Django backend over HTTP; Django should not
 import AEGIS runtime classes directly.
 
-## 7. OCR and tests
+## 8. OCR and tests
 
 Run the OCR smoke checks with the repository's available fixtures, then the
 full test suite:
@@ -260,7 +322,7 @@ python -m pytest -q
 Live Ollama tests are marked separately and require the corresponding local
 model. Do not run them in an air-gapped environment until models are cached.
 
-## 8. Sharing and cleanup
+## 9. Sharing and cleanup
 
 Share source, `config/`, `docs/`, `requirements*.txt`, `pyproject.toml`, and
 `SETUP.md`. Do not share `.venv/`, `wheelhouse/`, `build/`, `dist/`,

@@ -33,6 +33,18 @@ source .venv/bin/activate
 python cli.py
 ```
 
+On Windows PowerShell, run:
+
+```powershell
+.\scripts\setup.ps1
+.\.venv\Scripts\Activate.ps1
+python cli.py
+```
+
+The installer creates a local virtual environment and installs the project in
+editable mode. It does not install Docker, Bubblewrap, Ollama, or model files.
+Those are optional host/runtime prerequisites described in [SETUP.md](SETUP.md).
+
 The complete dependency manifest is [requirements.txt](requirements.txt).
 For the HTTP service, run `uvicorn app.api.main:app --host 127.0.0.1 --port 8000`.
 Install Ollama separately and make the local models listed in
@@ -75,7 +87,7 @@ The system follows a strict layered topology:
                ┌────────────────────┼────────────────────┐
                ▼                    ▼                    ▼
         General LLM             Coding LLM           Vision LLM
-        (qwen3:8b)         (qwen2.5-coder:7b)     (qwen2.5-vl:7b)
+        (qwen3.5:9b)       (qwen2.5-coder:7b)       (qwen3-vl:8b)
                │                    │                    │
                └────────────────────┼────────────────────┘
                                     │
@@ -108,12 +120,12 @@ Security and observability wrap all operations:
 ## 3. Prerequisites & Dependencies
 
 ### System Requirements
-* **OS:** Linux (Ubuntu 20.04+, Debian 11+, RHEL 8+) or macOS
+* **OS:** Linux (Ubuntu 20.04+, Debian 11+, RHEL 8+), macOS 12+, or Windows 10+
 * **Python:** Python 3.10, 3.11, or 3.12
 * **Hardware:**
   * Minimum: 16 GB RAM, 4-core CPU (for small quantized models, e.g. `llama3.2:1b`)
   * Recommended: 32 GB RAM, Dedicated NVIDIA GPU with 8GB–16GB VRAM (for 7B/8B parameter models)
-* **Ollama:** Version 0.3.0 or higher
+* **Ollama:** Version 0.3.0 or higher, installed separately
 
 ### Core Dependencies
 * `langgraph` & `langchain-core`: Graph-based state machine orchestration.
@@ -130,18 +142,26 @@ Security and observability wrap all operations:
 ## 4. Installation
 
 ```bash
-# 1. Clone or navigate to the repository
-cd sih-agent-antigravity
-
-# 2. Create and activate a virtual environment
-python3 -m venv .venv
+# Linux/macOS
+bash scripts/setup.sh
 source .venv/bin/activate
+```
 
-# 3. Upgrade build tools
-pip install --upgrade pip setuptools wheel
+Windows PowerShell:
 
-# 4. Install the workbench package in editable mode with development dependencies
-pip install -e ".[dev]"
+```powershell
+.\scripts\setup.ps1
+.\.venv\Scripts\Activate.ps1
+```
+
+For Docker sandbox support, install the optional extra:
+
+```bash
+AEGIS_INSTALL_EXTRAS='dev,sandbox' bash scripts/setup.sh
+```
+
+```powershell
+.\scripts\setup.ps1 -Extras 'dev,sandbox'
 ```
 
 For offline or air-gapped environments:
@@ -168,13 +188,13 @@ Pull the designated sovereign model suite (or your preferred local equivalents):
 
 ```bash
 # General Reasoning & Document Processing
-ollama pull qwen3:8b
+ollama pull qwen3.5:9b
 
 # Code Generation & Debugging
 ollama pull qwen2.5-coder:7b
 
 # Vision & Multimodal Analysis
-ollama pull qwen2.5-vl:7b
+ollama pull qwen3-vl:8b
 
 # Lightweight Fallback Model
 ollama pull llama3.2:1b
@@ -195,7 +215,7 @@ The system discovers models dynamically via [`config/models.yaml`](config/models
 models:
   qwen-general:
     provider: ollama
-    model: "qwen3:8b"
+    model: "qwen3.5:9b"
     capabilities:
       - general
       - reasoning
@@ -217,7 +237,7 @@ models:
 
   qwen-vision:
     provider: ollama
-    model: "qwen2.5-vl:7b"
+    model: "qwen3-vl:8b"
     capabilities:
       - vision
       - multimodal
@@ -282,7 +302,7 @@ binds, and explicitly allowed environment variables.
 ```text
 You ▶ Explain the purpose of a Double Block and Bleed (DBB) valve arrangement.
 [Task Analysis]
-  Task type: general | Modality: text | Model: qwen-general (qwen3:8b)
+  Task type: general | Modality: text | Model: qwen-general (qwen3.5:9b)
 [Output] Streams response using local qwen-general model...
 ```
 
@@ -369,3 +389,4 @@ For in-depth specifications, refer to the documents in the [`docs/`](docs/) dire
 * [`docs/tools.md`](docs/tools.md) — Tool specifications, risk classifications, and schema definitions.
 * [`docs/security.md`](docs/security.md) — Air-gap compliance, sandbox policies, and audit schemas.
 * [`docs/workflows.md`](docs/workflows.md) — Workflow definitions, multi-step execution, and human approval.
+* [`SETUP.md`](SETUP.md) — Cross-platform installation, Ollama models, OCR, and optional sandboxes.
