@@ -179,6 +179,21 @@ class PolicyEngine:
             self._record("tool_policy", name=name, task_id=task_id, decision=decision.reason, allowed=decision.allowed)
             if not decision.allowed:
                 raise PolicyDenied(decision.reason)
+            # Validate exact edit targets before requesting human approval.
+            # This prevents an approval prompt for an edit that is already
+            # known to be missing or ambiguous, and gives the coding agent a
+            # deterministic tool error it can repair from source evidence.
+            if name == "edit_file" and "dry_run" not in parameters:
+                try:
+                    preflight = dict(parameters)
+                    preflight["dry_run"] = True
+                    validation = function(**preflight)
+                    if isinstance(validation, dict) and not validation.get("ok", False):
+                        self._record("tool_validation", name=name, task_id=task_id,
+                                     decision=validation.get("error", "validation_failed"), allowed=False)
+                        return validation
+                except TypeError:
+                    pass
             if decision.approval_required:
                 requester = self.approval_requester
                 request_id = f"approval:{task_id or 'run'}:{name}"

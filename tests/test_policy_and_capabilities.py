@@ -9,6 +9,7 @@ from runtime.tool_policy import PolicyDenied, PolicyEngine, ToolPolicy
 from storage.graph_state import SQLiteGraphStateStore
 from tools.calculator import calculator
 from tools.registry import ToolRegistry
+from tools.workspace import WorkspaceReadTools
 
 
 def test_capability_router_enforces_quality_bar() -> None:
@@ -29,6 +30,21 @@ def test_policy_is_deny_by_default_and_bounds_paths(tmp_path: Path) -> None:
     engine.register(ToolPolicy("calculator", timeout=2, max_output=10))
     assert not engine.evaluate("unknown").allowed
     assert not engine.evaluate("calculator", {"file_path": "/etc/passwd"}).allowed
+
+
+def test_edit_validation_precedes_approval_prompt(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    target = workspace / "main.py"
+    target.write_text("foo bar foo baz", encoding="utf-8")
+    prompts: list[str] = []
+    tools = WorkspaceReadTools(workspace, approver=lambda *args: True)
+    engine = PolicyEngine(workspace, approval_requester=lambda *args: prompts.append(str(args)) or True)
+    engine.register(ToolPolicy("edit_file", requires_approval=True, filesystem="workspace_only"))
+    edit = engine.wrap_callables({"edit_file": tools.edit_file})["edit_file"]
+    result = edit("main.py", "foo", "qux")
+    assert result["error"] == "old_text_ambiguous"
+    assert prompts == []
 
 
 def test_extraction_review_queue_and_sqlite_snapshot(tmp_path: Path) -> None:
