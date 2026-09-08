@@ -151,8 +151,16 @@ class PolicyEngine:
         tool = tool_override or registry.get(name)
         started = time.monotonic()
         try:
-            result = tool.ainvoke(args)
-            value = await asyncio.wait_for(result, timeout=decision.policy.timeout) if inspect.isawaitable(result) else result
+            if hasattr(tool, "ainvoke"):
+                result = tool.ainvoke(args)
+                value = await asyncio.wait_for(result, timeout=decision.policy.timeout) if inspect.isawaitable(result) else result
+            elif inspect.iscoroutinefunction(tool):
+                value = await asyncio.wait_for(tool(**args), timeout=decision.policy.timeout)
+            else:
+                # Legacy/specialist callables are synchronous. Keep them off
+                # the event loop so filesystem and subprocess tools cannot
+                # add latency to concurrent model/UI work.
+                value = await asyncio.wait_for(asyncio.to_thread(tool, **args), timeout=decision.policy.timeout)
             # Preserve structured tool results for the graph and verification
             # layers.  Only textual payloads are truncated here; converting a
             # dict result to text would silently destroy evidence fields such

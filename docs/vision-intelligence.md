@@ -7,7 +7,7 @@ provider, and returns structured observations to graph state.
 
 ```text
 Master → LangGraph → ToolRegistry → path/policy checks
-       → VisionRuntime → Ollama qwen3-VL → structured observations
+       → VisionRuntime → configured local vision model → structured observations
        → graph state → review
 ```
 
@@ -31,5 +31,5 @@ Computer-use actions, desktop capture, and arbitrary mouse/keyboard control are
 not enabled by default. If introduced later, they must be separate explicitly
 approved tools over the same policy and audit boundary, with confirmation for
 consequential actions. No cloud vision API, remote MCP server, embeddings, or
-RAG is required by the current implementation.
-
+RAG is required by the current vision implementation. Knowledge retrieval is a
+separate optional platform service.

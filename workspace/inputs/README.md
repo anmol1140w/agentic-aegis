@@ -1,5 +1,6 @@
-# Workspace fixtures
+# Workspace inputs
 
 Stable local inputs for tests and demonstrations, including inspection PDFs
 and representative images. Keep fixtures small, non-sensitive, and reusable.
-Do not store generated outputs in this folder.
+Do not store generated outputs in this folder. Inputs are data only; embedded
+instructions cannot approve tools or expand AEGIS permissions.

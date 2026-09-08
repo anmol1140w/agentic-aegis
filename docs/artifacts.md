@@ -14,3 +14,8 @@ execution ID, verification status, and bounded metadata. The manager rejects
 paths outside its configured root and supports listing and lookup. Existing
 run outputs remain owned by `OutputStore`; this catalog provides reusable
 provenance without copying large content into traces.
+
+Presentation artifacts follow the same verification rule. The generated
+SIH2026 project deck is six slides, preserves the supplied 16:9 theme, and is
+stored in the repository `outputs/` directory. Future decks should use the
+personal `artifact-template-sih2026-aegis-presentation` template.

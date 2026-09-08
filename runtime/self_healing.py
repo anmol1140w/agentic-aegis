@@ -20,8 +20,13 @@ def classify_failure(result: dict[str, Any]) -> dict[str, Any]:
         code_value = first.get("code") if isinstance(first, dict) else first
     code = str(code_value or "tool_failure")
     retryable = code not in NON_RETRYABLE and not result.get("policy_denied", False)
-    return {"error_code": code, "retryable": retryable,
-            "reason": "recoverable tool failure" if retryable else "policy or permission failure"}
+    if code == "max tool steps reached":
+        reason = "coding action budget exhausted"
+    elif retryable:
+        reason = "recoverable tool failure"
+    else:
+        reason = "policy or permission failure"
+    return {"error_code": code, "retryable": retryable, "reason": reason}
 
 
 def failure_record(result: dict[str, Any], *, command: str = "", file: str = "") -> FailureRecord:

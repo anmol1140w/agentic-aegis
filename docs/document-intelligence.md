@@ -17,10 +17,11 @@ queries return structured failures. Results contain a stable document ID,
 relative source path, section/page labels where available, bounded excerpts,
 offsets for text formats, and truncation metadata.
 
-Search is deterministic lexical matching today. It does not require Ollama,
-embeddings, a vector database, or network access. A future retrieval adapter
-may be inserted behind the same tool contract, but RAG is not part of current
-execution.
+Document search remains deterministic lexical matching in `DocumentTools`.
+For indexed knowledge across sources, `aegis.retrieval.HybridKnowledgeStore`
+adds offline hybrid retrieval and source metadata/citations. It does not
+require Ollama, a vector database, or network access. Semantic similarity is
+optional and requires a caller-supplied embedding callback.
 
 DOCX extraction preserves paragraphs, style/heading names, and table rows.
 PDF extraction uses local PyMuPDF; PPTX extraction uses local `python-pptx`.
@@ -38,4 +39,3 @@ Example tool calls:
 The model receives only the returned excerpts and source metadata, not an
 unbounded full-document payload. Audit traces record tool names, status,
 duration, result size, and source references without storing whole documents.
-

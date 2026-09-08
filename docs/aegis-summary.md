@@ -1,8 +1,9 @@
 # AEGIS current system summary
 
 AEGIS is a local-first, Master-first workbench for coding, documents, vision,
-and verified artifacts. It uses local Ollama inference and does not use cloud
-fallbacks in the normal path.
+retrieval, and verified artifacts. It uses local Ollama inference and does not
+use cloud fallbacks in the normal path. The platform layer also exposes typed
+plans, governance, memory, evaluation, background jobs, and auditable events.
 
 ## Current flow
 
@@ -20,9 +21,9 @@ requested, a reviewer result, and a checkpoint or explicit safe path.
 
 | Role | Config alias | Default model |
 |---|---|---|
-| Master/general/document | `qwen-general` | `qwen3.5:9b` |
-| Coding | `qwen-coder` | `qwen2.5-coder:7b` |
-| Vision | `qwen-vision` | `qwen3-vl:8b` |
+| Master/general/document | `qwen-general` | configured in `config/models.yaml` |
+| Coding | `qwen-coder` | configured in `config/models.yaml` |
+| Vision | `qwen-vision` | configured in `config/models.yaml` |
 | Lightweight capability profile | `llama-small` | configured locally; not an initial handoff |
 
 Change model tags only in `config/models.yaml`.
@@ -35,8 +36,27 @@ files with provenance, and `workspace/executions` stores bounded command
 records. Per-run result and trace files are generated under
 `workspace/outputs/<run_id>/`.
 
-## Explicit non-goals
+Platform runtime state lives in `.aegis/` and `logs/aegis-chain.jsonl`.
+It includes checkpoints, scoped memory, evaluation records, and a hash-chained
+audit trail. These files are local operational state, not source artifacts.
+
+## Current platform capabilities
+
+| Capability | Current implementation |
+|---|---|
+| Typed workflows | `aegis.contracts.ExecutionPlan`, validation, registry |
+| Governance | RBAC, group permissions, department model/tool policy |
+| Retrieval | Offline hybrid lexical retrieval with optional embeddings |
+| Memory | Scoped SQLite records with TTL and deletion |
+| Long-running work | Bounded retryable and cancellable background jobs |
+| Evaluation | Persistent quality, latency, recovery, and error metrics |
+| Audit | Append-only JSONL plus hash-chain verification |
+
+## Explicit boundaries
 
 Cloud inference, unrestricted shell, network tools, Git mutation, delete tools,
-desktop control, embeddings/vector retrieval, and silent completion claims are
-not enabled by the current architecture.
+and desktop control remain restricted or disabled by default. Embedding
+retrieval is optional and only activates when an embedding callback is
+configured. A2A, RL routing, TEE, federation, Kubernetes, blockchain anchoring,
+and live identity federation remain extension points, not default runtime
+dependencies. Silent completion claims are never accepted.

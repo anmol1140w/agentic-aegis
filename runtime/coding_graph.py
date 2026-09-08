@@ -239,7 +239,15 @@ def build_coding_graph(provider: Any, tool_registry: Any, *, allowed_tools: set[
         result = state.get("tool_result", {})
         results = [*state.get("tool_results", []), result]
         tool_name = result.get("tool", "unknown")
-        messages = [*state.get("messages", []), HumanMessage(content=f"TOOL RESULT [{tool_name}]: {json.dumps(result, default=str)[:12000]}")]
+        observation = f"TOOL RESULT [{tool_name}]: {json.dumps(result, default=str)[:12000]}"
+        if tool_name == "read_file" and result.get("error") == "NotFile":
+            observation += (
+                "\nThe requested path does not exist. If the user asked to create or save it, "
+                "use create_file or create_python_script now; do not retry read_file. "
+                "If the user asked to fix an existing file, use find_files or search_files "
+                "to locate a likely spelling correction before reading again."
+            )
+        messages = [*state.get("messages", []), HumanMessage(content=observation)]
         verification = verify_tool_result(result)
         step_events = [_event("step_succeeded" if verification.get("passed") else "step_failed",
                               tool=tool_name, verification=verification)]

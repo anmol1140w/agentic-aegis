@@ -6,6 +6,12 @@ commands require approval. Network, credentials, deletes, Git mutation,
 arbitrary shell, and workspace escapes are denied. All model inference and
 OCR remain local. These controls apply equally to CLI and FastAPI executions.
 
+The platform layer adds governance for explicit workflows: `RBAC` combines
+roles and groups, `PolicyEngine` restricts models and tools by department, and
+`SovereignExecutor` validates typed plans before routing or execution.
+`AuditChain` links platform events with hashes so local tampering is
+detectable.
+
 ---
 
 ## 1. Threat Model & Boundaries
@@ -106,7 +112,7 @@ Unlike mock indicators, `NetworkMonitor` queries the Linux kernel TCP/UDP connec
 
 ---
 
-## 4. Audit Logging (`security/audit.py`)
+## 4. Audit Logging (`security/audit.py` and `aegis/governance.py`)
 
 All lifecycle events write to an append-only JSONL file at `logs/audit.jsonl`:
 
@@ -116,7 +122,7 @@ All lifecycle events write to an append-only JSONL file at `logs/audit.jsonl`:
   "event": "model_invoked",
   "task_id": "a1b2c3d4",
   "user": "local",
-  "model": "qwen2.5-coder:7b",
+  "model": "configured model tag from config/models.yaml",
   "tool": null,
   "action": null,
   "status": "success",
@@ -125,3 +131,6 @@ All lifecycle events write to an append-only JSONL file at `logs/audit.jsonl`:
   "error": null
 }
 ```
+
+Explicit typed-plan API workflows additionally write to
+`logs/aegis-chain.jsonl`. Check its integrity with `GET /api/audit/verify`.

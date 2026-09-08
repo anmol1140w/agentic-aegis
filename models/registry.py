@@ -9,9 +9,12 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import TYPE_CHECKING
+import os
+import asyncio
 
 import yaml
 
+from config.env import load_env
 from .base import ModelCapability, ModelConfig, ModelProvider
 from .ollama import OllamaProvider
 
@@ -59,9 +62,10 @@ class ModelRegistry:
     def from_yaml(
         cls,
         path: str | Path,
-        base_url: str = "http://localhost:11434",
+        base_url: str | None = None,
     ) -> ModelRegistry:
         """Load the registry from a YAML file."""
+        load_env()
         path = Path(path)
         if not path.exists():
             raise FileNotFoundError(f"Model config not found: {path}")
@@ -70,18 +74,27 @@ class ModelRegistry:
             raw = yaml.safe_load(fh)
 
         configs: dict[str, ModelConfig] = {}
+        model_env = {
+            "qwen-general": "AEGIS_MODEL_GENERAL",
+            "qwen-vision": "AEGIS_MODEL_VISION",
+            "qwen-coder": "AEGIS_MODEL_CODER",
+            "llama-small": "AEGIS_MODEL_LIGHTWEIGHT",
+        }
         for name, entry in raw.get("models", {}).items():
             caps = [ModelCapability(c) for c in entry.get("capabilities", [])]
+            env_name = model_env.get(name)
+            model_tag = os.getenv(env_name, entry["model"]) if env_name else entry["model"]
             configs[name] = ModelConfig(
                 name=name,
                 provider=entry["provider"],
-                model=entry["model"],
+                model=model_tag,
                 capabilities=caps,
                 context_length=entry.get("context_length", 8192),
                 priority=entry.get("priority", 5),
                 is_fallback=entry.get("is_fallback", False),
+                supports_thinking=entry.get("supports_thinking", False),
             )
-        return cls(configs, base_url)
+        return cls(configs, base_url or os.getenv("AEGIS_OLLAMA_BASE_URL", "http://localhost:11434"))
 
     # -- Queries --------------------------------------------------------
 
@@ -118,13 +131,14 @@ class ModelRegistry:
 
     async def check_availability(self) -> dict[str, bool]:
         """Health‑check every registered model and return name → status."""
-        results: dict[str, bool] = {}
-        for name, provider in self._providers.items():
+        async def check(name: str, provider: ModelProvider) -> tuple[str, bool]:
             try:
-                results[name] = await provider.health_check()
+                return name, await provider.health_check()
             except Exception:
-                results[name] = False
-        return results
+                return name, False
+
+        pairs = await asyncio.gather(*(check(name, provider) for name, provider in self._providers.items()))
+        return dict(pairs)
 
     @property
     def provider_names(self) -> list[str]:

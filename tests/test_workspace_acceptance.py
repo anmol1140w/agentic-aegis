@@ -96,6 +96,7 @@ async def test_read_only_workspace_acceptance_flow(
 
     provider = FakeProvider(provider_script)
     provider.config = registry.get_provider("qwen-coder").config
+    provider.model_id = registry.get_provider("qwen-coder").model_id
     registry._providers["qwen-coder"] = provider
 
     events = [e async for e in orchestrator.astream(user_request, f"accept-{expected_tool}")]
@@ -112,7 +113,7 @@ async def test_read_only_workspace_acceptance_flow(
 
     # Verify model
     metadata = json.loads((run_dir / "metadata.json").read_text(encoding="utf-8"))
-    assert metadata["model"] == "qwen2.5-coder:7b"
+    assert metadata["model"] == registry.get_provider("qwen-coder").model_id
     assert metadata["task_type"] == TaskType.CODING.value
 
     # Verify tool execution

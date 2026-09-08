@@ -41,6 +41,18 @@ The service is local-only by default. Django should call this HTTP boundary;
 it should not import AEGIS internals. File metadata is passed as context and
 is still subject to the runtime workspace and policy boundaries.
 
+## Platform endpoints
+
+Validate and register typed workflows through `/api/workflows/validate` and
+`/api/workflows`. Knowledge and memory use `/api/knowledge`,
+`/api/knowledge/search`, `/api/memory`, and `/api/memory/search`.
+Operational endpoints include `POST /api/jobs`, `GET /api/jobs/{job_id}`,
+`DELETE /api/jobs/{job_id}`, `GET /api/audit/verify`, and
+`GET /api/evaluations/summary`.
+
+The current API principal adapter is local-admin for the prototype. Replace it
+or front it with enterprise identity before deployment to multiple users.
+
 ## Terminal client
 
 The same Master runtime is available without HTTP:

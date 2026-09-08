@@ -48,7 +48,6 @@ from tools.documents import DocumentTools
 from tools.vision import VisionRuntime
 from tools.permissions import AccessMode, SessionPermissions
 from tools.registry import ToolRegistry
-from tools.mcp_adapter import AegisMCPAdapter
 from runtime.prompts import SYSTEM_PROMPT, TOOL_LOOP_PROMPT
 from runtime.tool_policy import PolicyDenied, build_policy_engine
 from runtime.official_documents import OfficialDocumentWorkflow
@@ -140,9 +139,9 @@ class Orchestrator:
             name="write_official_document", filesystem="deliverables_only",
             requires_approval=True, max_output=20_000,
         ))
-        self.mcp_adapter = AegisMCPAdapter(self.tool_registry)
-        # Additive capability-driven workflow seam; existing graph remains the
-        # backwards-compatible default during migration.
+        # Capability-driven specialist tools are wrapped by the canonical
+        # policy gateway. MCP remains an optional transport adapter and is not
+        # constructed here because normal execution does not require it.
         specialist_tools = {
                 "read_file": self.workspace_tools.read_file,
                 "list_directory": self.workspace_tools.list_directory,
@@ -319,7 +318,10 @@ class Orchestrator:
             "agent_results": result_items,
             "master_plan": graph_state.get("plan", []),
             "verification": graph_state.get("verification", {}),
-            "errors": graph_state.get("errors", []),
+            # Internal retry history remains in telemetry/trace, but a
+            # recovered completed run must not present its stale timeout as a
+            # final user-facing error.
+            "errors": [] if status == "success" else graph_state.get("errors", []),
             "repair_history": graph_state.get("repair_history", []),
             "selected_agent": graph_state.get("selected_agent", ""),
             "selected_model": graph_state.get("selected_model", ""),
@@ -962,7 +964,7 @@ class Orchestrator:
                     elif kind == "result":
                         meta = {
                             "step": loop_event.get("iteration"),
-                            "model": state.get("selected_model_id") or getattr(provider, "model_id", "qwen2.5-coder:7b"),
+                            "model": state.get("selected_model_id") or getattr(provider, "model_id", "configured"),
                             "tool": loop_event["tool"],
                             "arguments": loop_event.get("arguments", {}),
                             "status": loop_event["status"],

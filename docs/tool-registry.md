@@ -8,4 +8,7 @@ filters, and `check_available` support bounded discovery.
 The orchestrator registers calculator, file/document/OCR primitives, and
 workspace read/edit/command handlers. Specialist descriptors further narrow
 which registered tools they may use. Unknown tools are rejected before
-execution.
+execution. `aegis.contracts.PlanValidator` also checks that explicit typed
+workflows reference only allowed tools and models before execution. MCP-shaped
+integrations pass through the same registry, policy, approval, and audit
+boundaries.

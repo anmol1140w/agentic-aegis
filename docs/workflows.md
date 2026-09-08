@@ -14,6 +14,11 @@ The master does not expose privileged mutation tools directly. Specialists get
 only their allowlisted tools. The lightweight model is not a first-stage
 terminal specialist; the master owns the route and review.
 
+API consumers that construct explicit workflows should use
+`aegis.contracts.ExecutionPlan`. Validate the plan before invoking a model or
+tool; validation rejects unknown dependencies, cycles, disallowed models,
+disallowed tools, and capability mismatches.
+
 ## Coding workflow
 
 ```text
@@ -45,3 +50,7 @@ Each run writes `result.txt`, `metadata.json`, `trace.json`, and when applicable
 `network_report.json` under `workspace/outputs/<run_id>/`. Commands also write a
 bounded record under `workspace/executions/`. Artifacts created under
 `workspace/artifacts/` receive provenance and SHA-256 registration.
+
+Long-running API work uses `runtime.background` with bounded concurrency,
+retry budgets, status inspection, and cancellation. Such jobs should emit an
+audit event and record evaluation data when they complete.

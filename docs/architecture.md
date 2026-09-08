@@ -34,6 +34,28 @@ Every action follows `decide → validate → execute → observe → update →
 Mutations are serialized, checkpoint-protected, approval-gated, and never
 performed concurrently.
 
+The `aegis.sovereign.SovereignExecutor` typed-plan seam is not a second normal
+task runner. It exists for explicit workflow integrations and contract tests;
+normal CLI/API requests remain on `Orchestrator.run_master` and
+`runtime.task_graph`. Optional MCP, RL, A2A, TEE, federation, Kubernetes, and
+ledger adapters are not required on that path. The implemented `aegis/`
+contracts are available to API consumers and can be adopted by future
+executors without changing the normal CLI route.
+
+## Platform contracts
+
+`aegis.contracts.ExecutionPlan` represents a typed dependency graph.
+`PlanValidator` checks dependencies, cycles, allowed tools, allowed models, and
+capability compatibility before execution. `WorkflowRegistry` stores named
+versioned plans.
+
+`aegis.governance` provides role/group permissions, department model/tool
+policies, and `AuditChain`, an append-only hash-chained JSONL log. Retrieval is
+provided by `HybridKnowledgeStore`, which works offline with lexical ranking
+and can accept an optional embedding callback. `MemoryStore` provides scoped
+SQLite memory with TTL. `BackgroundJobManager` provides bounded retries and
+cancellation.
+
 ## Agents
 
 - `master_agent`: only production orchestrator.

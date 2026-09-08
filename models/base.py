@@ -24,6 +24,7 @@ class ModelCapability(str, Enum):
     GENERAL = "general"
     REASONING = "reasoning"
     CODING = "coding"
+    CODE_EXECUTION = "code_execution"
     DEBUGGING = "debugging"
     VISION = "vision"
     MULTIMODAL = "multimodal"
@@ -50,6 +51,7 @@ class ModelConfig(BaseModel):
     context_length: int = 8192
     priority: int = 5                           # higher = preferred when tied
     is_fallback: bool = False
+    supports_thinking: bool = False             # provider-specific optional channel
 
 
 # ---------------------------------------------------------------------------

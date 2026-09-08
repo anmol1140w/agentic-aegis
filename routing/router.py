@@ -33,7 +33,7 @@ class RoutingResult(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     model_name: str           # registry key, e.g. "qwen-coder" or "direct_tool"
-    model_id: str             # Ollama tag, e.g. "qwen2.5-coder:7b" or "none"
+    model_id: str             # Provider-specific tag from config/models.yaml
     score: float
     reason: str
     is_direct_tool: bool = False

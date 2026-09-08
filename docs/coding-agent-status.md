@@ -35,6 +35,10 @@ surface for older library callers. Normal CLI/API requests do not enter it;
 they use the universal graph and the same registry, policy, approval, and tool
 implementations.
 
+The platform layer is additive to this path. Coding runs can emit typed plan,
+policy, checkpoint, background-job, evaluation, and hash-chained audit records
+without changing the specialist tool loop.
+
 ## Plan, evidence, and bounded repair
 
 `runtime/task_state.py` defines serializable task and step status contracts.

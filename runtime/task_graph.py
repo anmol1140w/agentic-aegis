@@ -205,7 +205,17 @@ def build_task_graph(master: MasterAgent, *, workspace_root: str,
         if spec.get("requires_human_approval"):
             _emit(progress_callback, "approval_checkpoint", status="required", action=spec.get("workflow", "artifact_generation"))
         delegation_request = str(spec.get("enhanced_request") or state["original_request"])
-        if spec.get("workflow") == "psu_approval_note_explain":
+        # Greetings are deterministic and do not need capability discovery to
+        # wake a local model. This keeps the interactive shell responsive and
+        # makes the fast path independent of Ollama availability.
+        if re.fullmatch(r"\s*(hi|hello|hey|howdy|good\s+(morning|afternoon|evening))\s*[!.?]*\s*", state["original_request"], re.I):
+            result = AgentResult(
+                agent=current_agent, status=AgentStatus.SUCCESS,
+                summary="Hello! How can I help?",
+                verification={"required": True, "status": "passed", "method": "deterministic_greeting"},
+                metadata={"deterministic": True, "model_call": False},
+            )
+        elif spec.get("workflow") == "psu_approval_note_explain":
             # Explain-intent is grounded from the canonical domain contract;
             # the model may fill fields later, but cannot redefine the term.
             from routing.approval_note import explain_approval_note
@@ -294,9 +304,13 @@ def build_task_graph(master: MasterAgent, *, workspace_root: str,
         result = (state.get("step_results") or [{}])[-1]
         failure = classify_failure(result)
         if not failure["retryable"]:
+            if failure.get("error_code") == "max tool steps reached":
+                message = "The coding step reached its action limit before a final verified result."
+            else:
+                message = "Repair is not permitted for this policy or path failure."
             return {
                 "status": TaskStatus.FAILED.value,
-                "errors": [{**failure, "message": "Repair is not permitted for this policy or path failure."}],
+                "errors": [{**failure, "message": message}],
                 "trace": [_emit(progress_callback, "repair_rejected",
                                   reason="non_retryable", error_code=failure["error_code"])],
             }

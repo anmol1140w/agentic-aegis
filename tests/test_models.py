@@ -249,7 +249,9 @@ class TestOllamaProvider:
         assert payload["messages"][0]["images"] == encoded
         assert str(image) not in str(payload)
         assert encoded[0].startswith("/9j/")
-        assert payload["think"] is False
+        # Unsupported models must receive no `think` field at all; Ollama
+        # rejects the presence of that option for those model families.
+        assert "think" not in payload
 
     def test_invalid_image_is_rejected_before_request(self, tmp_path: Path) -> None:
         image = tmp_path / "not-an-image.jpg"

@@ -100,7 +100,7 @@ class AgentState(TypedDict, total=False):
     # -- Routing --
     execution_mode: str             # "direct_tool", "model", "model_with_tools"
     selected_model: str             # registry name, e.g. "qwen-coder" or "direct_tool"
-    selected_model_id: str          # Ollama tag, e.g. "qwen2.5-coder:7b" or "none"
+    selected_model_id: str          # Provider-specific tag from config/models.yaml
     routing_reason: str
     is_direct_tool: bool
 

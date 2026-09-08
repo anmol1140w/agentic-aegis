@@ -22,7 +22,7 @@ metadata, rather than one agent per file format.
 | Database | schema/read/query; writes require approval | P1/P2 |
 | Spreadsheet/presentation | workbook/cell/chart and slide primitives | P1 |
 | Web/API/browser/communication | HTTP, browser, email, calendar, hosting | P3, disabled offline |
-| Memory/RAG | session state; retrieval/embeddings/vector search | P2/P3; RAG deferred |
+| Memory/RAG | scoped memory; lexical hybrid retrieval; optional embeddings/citations | P1; implemented in `aegis/` |
 | Security/observability | policy checks, approvals, trace/metrics | P0 |
 
 Tools are discovered by registry search and bound only to the specialist that

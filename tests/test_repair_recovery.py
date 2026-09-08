@@ -137,3 +137,48 @@ async def test_max_tool_steps_is_terminal_failure(tmp_path: Path) -> None:
     assert result.status is AgentStatus.FAILURE
     assert "max tool steps reached" in result.errors
     assert result.verification.get("status") != "passed"
+
+
+@pytest.mark.asyncio
+async def test_named_file_edit_finishes_after_verified_change(tmp_path: Path) -> None:
+    (tmp_path / "add_numbers.py").write_text("def add_numbers(a, b):\n    return a + b\n", encoding="utf-8")
+    provider = _Provider([
+        json.dumps({"action": "tool", "tool": "edit_file", "arguments": {
+            "path": "add_numbers.py",
+            "old_text": "def add_numbers(a, b):\n    return a + b",
+            "new_text": "def add_numbers(*values):\n    return sum(values)",
+        }}),
+        json.dumps({"action": "tool", "tool": "edit_file", "arguments": {
+            "path": "add_numbers.py",
+            "old_text": "def add_numbers(*values):\n    return sum(values)",
+            "new_text": "def add_numbers(*values):\n    return sum(values)\n\ndef extra():\n    pass",
+        }}),
+    ])
+
+    result = await _agent(tmp_path, provider).run(
+        _request("edit add_numbers.py to add n numbers", "add_numbers.py")
+    )
+
+    assert result.status is AgentStatus.SUCCESS
+    assert "add_numbers.py updated successfully" in result.summary
+    contents = (tmp_path / "add_numbers.py").read_text(encoding="utf-8")
+    assert "sum(values)" in contents
+    assert "def extra" not in contents
+    assert provider.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_verified_edit_survives_action_budget_without_final(tmp_path: Path) -> None:
+    (tmp_path / "math_lib.py").write_text("def value():\n    return 1\n", encoding="utf-8")
+    provider = _Provider([
+        json.dumps({"action": "tool", "tool": "edit_file", "arguments": {
+            "path": "math_lib.py", "old_text": "return 1", "new_text": "return 2",
+        }}),
+    ])
+
+    result = await _agent(tmp_path, provider).run(_request("change math_lib.py to return 2", "math_lib.py"))
+
+    assert result.status is AgentStatus.SUCCESS
+    assert (tmp_path / "math_lib.py").read_text(encoding="utf-8") == "def value():\n    return 2\n"
+    assert result.errors == []
+

@@ -42,22 +42,16 @@ from security.audit import AuditLogger
 from security.network import NetworkMonitor
 from tools.workspace import WorkspaceReadTools
 from tools.files import set_workspace_root
+from ui.terminal import TerminalUI, AEGIS_THEME
 
 # ---------------------------------------------------------------------------
 # Rich theme
 # ---------------------------------------------------------------------------
 
-_THEME = Theme({
-    "info": "dim cyan",
-    "success": "bold green",
-    "warning": "bold yellow",
-    "error": "bold red",
-    "model": "bold magenta",
-    "tool": "bold cyan",
-    "step": "dim white",
-})
+_THEME = AEGIS_THEME
 
 console = Console(theme=_THEME)
+terminal_ui = TerminalUI(console)
 
 
 # ---------------------------------------------------------------------------
@@ -66,42 +60,15 @@ console = Console(theme=_THEME)
 
 def _print_banner() -> None:
     console.set_window_title("AEGIS — Sovereign Agent Workbench")
-    glyphs = {
-        "A": (" █████ ", "██   ██", "███████", "██   ██", "██   ██"),
-        "E": ("███████", "██     ", "█████  ", "██     ", "███████"),
-        "G": (" ██████ ", "██      ", "██ ████ ", "██   ██ ", " ██████ "),
-        "I": ("███████", "   ██  ", "   ██  ", "   ██  ", "███████"),
-        "S": (" ██████", "██     ", " █████  ", "     ██ ", "██████  "),
-    }
-    rows = ["  ".join(glyphs[letter][row] for letter in "AEGIS") for row in range(5)]
-
-    banner = Text()
-    # A small offset extrusion gives the wordmark a 3-D terminal effect while
-    # remaining safe on terminals that do not support cursor positioning.
-    for index, row in enumerate(rows):
-        banner.append("  " + row.replace("█", "▓") + "╲\n", style="bold blue")
-        banner.append(row + "╲\n", style="bold bright_cyan")
-    banner.append("\n")
-    banner.append("  A  E  G  I  S   •   SOVEREIGN AGENT WORKBENCH\n", style="bold white")
-    banner.append("  Local inference  •  private workspace  •  policy-controlled tools", style="dim")
-    console.print(Panel(banner, border_style="bright_cyan", padding=(1, 3)))
+    console.print("[accent]AEGIS[/accent]")
+    console.print("[muted]Sovereign AI Workbench[/muted]")
+    console.print(Rule(style="dim"))
 
 
 def _print_session_header(session_id: str, availability: dict[str, bool], registry: ModelRegistry) -> None:
-    """Render a compact dashboard before entering the interactive REPL."""
-    table = Table(show_header=True, header_style="bold bright_cyan", box=None, padding=(0, 2))
-    table.add_column("Role", style="dim")
-    table.add_column("Model")
-    table.add_column("State", justify="center")
-    for role in ("qwen-general", "qwen-vision", "qwen-coder", "llama-small"):
-        try:
-            model = registry.get_provider(role).config.model
-        except Exception:
-            model = "configured"
-        available = availability.get(role, False)
-        table.add_row(role, model, "[success]ONLINE[/success]" if available else "[error]OFFLINE[/error]")
-    console.print(Panel(table, title=f"[bold]Session {session_id}[/bold]  [dim]Master-first / LangGraph[/dim]",
-                        subtitle="[dim]Type /help for commands[/dim]", border_style="blue"))
+    """Render the session line and registry-driven model table."""
+    terminal_ui.session(session_id)
+    terminal_ui.models(registry, availability)
 
 
 def _print_result_summary(result: dict[str, Any]) -> None:
@@ -199,8 +166,12 @@ async def _handle_slash_command(raw_input: str, registry: ModelRegistry, network
         console.print("[info]Goodbye.[/info]")
         return "exit"
     if command == "/models":
-        for name, available in (await registry.check_availability()).items():
-            console.print(f"  {'✓' if available else '✗'} {name}")
+        availability = await registry.check_availability()
+        if hasattr(registry, "list_models"):
+            terminal_ui.models(registry, availability)
+        else:
+            for name, available in availability.items():
+                console.print(f"  {'✓' if available else '○'} {name}")
         return "handled"
     if command == "/network":
         _print_network(network)
@@ -231,14 +202,7 @@ async def _handle_slash_command(raw_input: str, registry: ModelRegistry, network
                             border_style=style))
         return "handled"
     if command in {"/help", "/commands"}:
-        console.print(Panel(
-            "[bold]/models[/bold]  show local model health\n"
-            "[bold]/network[/bold] show network/tool counters\n"
-            "[bold]/sandbox[/bold] verify command sandbox and policy\n"
-            "[bold]/status[/bold]  show AEGIS operating principles\n"
-            "[bold]/clear[/bold]   clear the terminal\n"
-            "[bold]/quit[/bold]    exit AEGIS",
-            title="[bold bright_cyan]AEGIS Commands[/bold bright_cyan]", border_style="blue"))
+        terminal_ui.help()
         return "handled"
     if command == "/status":
         console.print(Panel(
@@ -253,6 +217,10 @@ async def _handle_slash_command(raw_input: str, registry: ModelRegistry, network
         console.clear()
         _print_banner()
         return "handled"
+    if command == "/debug":
+        terminal_ui.debug = not terminal_ui.debug
+        console.print(f"[muted]debug output {'enabled' if terminal_ui.debug else 'disabled'}[/muted]")
+        return "handled"
     if command == "/master":
         console.print("[info]Master-agent mode enabled for the next request.[/info]")
         return "master"
@@ -264,8 +232,6 @@ async def _handle_slash_command(raw_input: str, registry: ModelRegistry, network
 # ---------------------------------------------------------------------------
 
 async def _run() -> None:
-    _print_banner()
-
     # Resolve config paths
     config_dir = _PROJECT_ROOT / "config"
     models_yaml = config_dir / "models.yaml"
@@ -278,7 +244,7 @@ async def _run() -> None:
     registry = ModelRegistry.from_yaml(models_yaml)
 
     # Health check
-    console.print("\n[info]Checking model availability…[/info]")
+    console.print("[muted]Checking local model availability...[/muted]")
     availability = await registry.check_availability()
     any_available = False
     for available in availability.values():
@@ -306,12 +272,13 @@ async def _run() -> None:
     thread_id = f"session-{uuid.uuid4().hex[:8]}"
     master_mode = False
 
-    _print_session_header(thread_id, availability, registry)
-    console.print(Rule("Ready", style="dim blue"))
+    terminal_ui.startup(registry, availability)
+    terminal_ui.session(thread_id)
+    console.print(Rule("ready", style="dim"))
 
     while True:
         try:
-            user_input = console.input("[bold green]You ▶[/bold green] ").strip()
+            user_input = console.input("[cyan]you[/cyan] [dim]>[/dim] ").strip()
         except (EOFError, KeyboardInterrupt):
             console.print("\n[info]Goodbye.[/info]")
             break
@@ -337,6 +304,8 @@ async def _run() -> None:
 
         try:
             def _master_progress(event: dict[str, Any]) -> None:
+                terminal_ui.event(event)
+                return
                 name = str(event.get("event", "")).replace("_", " ").title()
                 if name in {"Preprocessing Started", "Preprocessing Completed"}:
                     return
@@ -431,9 +400,7 @@ async def _run() -> None:
                 elif name == "Final":
                     console.print("  [step]✓ Final response prepared[/step]")
 
-            console.print()
-            console.print(Panel(f"[bold]Request[/bold]\n{user_input}", border_style="dim", padding=(0, 1)))
-            console.print("  [info]⏳ Local model processing…[/info]")
+            terminal_ui.request(user_input)
             # Do not wrap the run in Rich's live spinner: approval prompts use
             # stdin and must remain visible/interactive on every terminal.
             def _live_progress(event: dict[str, Any]) -> None:
@@ -472,12 +439,7 @@ async def _run() -> None:
                     answer = "Task completed. See output directory for artifacts."
             else:
                 answer = raw_answer
-            console.print(Panel(answer, title="[bold bright_cyan]AEGIS Response[/bold bright_cyan]", border_style="green" if not master_result.get("errors") else "yellow"))
-            if master_result.get("errors"):
-                console.print(f"[warning]Master errors: {master_result['errors']}[/warning]")
-            if master_result.get("output_dir"):
-                console.print(f"[success]✓ output saved:[/success] {master_result['output_dir']}")
-            _print_result_summary(master_result)
+            terminal_ui.result(master_result, answer)
             console.print()
             continue
         except KeyboardInterrupt:

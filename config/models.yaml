@@ -14,6 +14,7 @@ models:
       - artifact_generation
     context_length: 32768
     priority: 10
+    supports_thinking: true
 
   qwen-vision:
     provider: ollama
@@ -25,16 +26,18 @@ models:
       - document_analysis
     context_length: 32768
     priority: 10
+    supports_thinking: true
 
   qwen-coder:
     provider: ollama
-    model: "qwen2.5-coder:7b"
+    model: "qwen3-coder:30b-a3b-q4_K_M"
     capabilities:
       - coding
       - debugging
-      - calculation
+      - code_execution
     context_length: 32768
     priority: 10
+    supports_thinking: false
 
   llama-small:
     provider: ollama
@@ -45,3 +48,4 @@ models:
     context_length: 8192
     priority: 1
     is_fallback: true
+    supports_thinking: false

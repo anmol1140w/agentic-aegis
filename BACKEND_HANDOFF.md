@@ -16,6 +16,13 @@ CLI/API
   → checkpoint/audit persistence
 ```
 
+Explicit workflow integrations additionally use:
+
+```text
+Principal → RBAC/policy → ExecutionPlan → preflight validation
+  → SovereignExecutor → risk approval → route → execute → verify → AuditChain
+```
+
 The stable baseline includes:
 
 - local Ollama model execution;
@@ -34,15 +41,19 @@ The stable baseline includes:
 - routing telemetry;
 - golden/regression tests;
 - security demonstration scripts.
+- typed workflow contracts and versioned registry;
+- local hybrid retrieval with source citations;
+- scoped SQLite memory with TTL;
+- retryable/cancellable background jobs;
+- evaluation records and API summaries;
+- visual workflow export and Kubernetes manifest planning as explicit extensions.
 
 ## 2. Installation and run
 
 ```bash
 bash scripts/setup.sh
 source .venv/bin/activate
-ollama pull qwen3.5:9b
-ollama pull qwen2.5-coder:7b
-ollama pull qwen3-vl:8b
+# Pull the model tags listed in config/models.yaml with Ollama.
 .venv/bin/python cli.py
 ```
 
@@ -67,6 +78,10 @@ directory. Generated artifacts are stored under `workspace/outputs/`.
 - Tool authorization: `runtime/tool_policy.py`
 - Checkpoints: `storage/graph_state.py`
 - Telemetry: `storage/telemetry.py`
+- Typed plans and validation: `aegis/contracts.py`
+- Governance and audit chain: `aegis/governance.py`
+- Retrieval and memory: `aegis/retrieval.py`, `aegis/memory.py`
+- Sovereign typed-plan seam: `aegis/sovereign.py`
 
 ## 5. Model requirements
 
@@ -121,6 +136,10 @@ and leave `AEGIS_ROUTING_MODE` unset or set to `shadow`.
 
 The adaptive layer must pass the security-first quality gate before any future
 promotion. It must never weaken PolicyEngine decisions.
+
+The SIH2026 presentation output uses the personal
+`artifact-template-sih2026-aegis-presentation` template and is separate from
+the backend runtime.
 
 ## 10. Handoff revision
 

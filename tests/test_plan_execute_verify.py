@@ -46,4 +46,7 @@ def test_self_healing_classifies_policy_failures_as_non_retryable():
     assert classify_failure({"error": "approval_denied"})["retryable"] is False
     assert classify_failure({"errors": ["approval_denied"]})["retryable"] is False
     assert classify_failure({"error": "command_timeout"})["retryable"] is True
+    max_steps = classify_failure({"errors": ["max tool steps reached"]})
+    assert max_steps["retryable"] is False
+    assert max_steps["reason"] == "coding action budget exhausted"
     assert normalize_repair_action({"action": "retry", "parameters": {}})["action"] == "retry"

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
 py-modules = ["cli"]
-packages = ["app", "app.api", "models", "routing", "runtime", "tools", "tools.ocr", "security", "storage", "pipeline", "evaluation"]
+packages = ["aegis", "app", "app.api", "config", "models", "routing", "runtime", "tools", "tools.ocr", "security", "storage", "pipeline", "evaluation", "ui"]
 
 [project]
 name = "sih-workbench"
@@ -17,11 +17,9 @@ dependencies = [
     "langchain-core>=0.3.0",
     "langchain-ollama>=0.3.0",
     "pydantic>=2.7.0",
-    "pydantic-settings>=2.0.0",
     "pyyaml>=6.0",
     "httpx>=0.27.0",
     "Pillow>=10.0",
-    "aiosqlite>=0.20.0",
     "psutil>=5.9.0",
     "rich>=13.0.0",
     "fastapi>=0.110.0",
@@ -30,7 +28,6 @@ dependencies = [
     "pypdf>=5.0.0",
     "python-docx>=1.0.0",
     "reportlab>=4.0.0",
-    "openpyxl>=3.1.0",
     "python-pptx>=1.0.0",
     "pymupdf>=1.24.0",
     "opencv-python-headless>=4.9.0",
@@ -52,7 +49,6 @@ ocr = [
 ]
 artifacts = [
     "python-docx>=1.0.0",
-    "openpyxl>=3.1.0",
     "python-pptx>=1.0.0",
     "reportlab>=4.0.0",
 ]

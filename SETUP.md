@@ -90,9 +90,7 @@ Start Ollama and pull the configured local aliases:
 
 ```bash
 ollama serve
-ollama pull qwen3.5:9b
-ollama pull qwen2.5-coder:7b
-ollama pull qwen3-vl:8b
+# Pull the model tags listed in config/models.yaml with Ollama.
 ollama list
 ```
 
@@ -132,7 +130,32 @@ export AEGIS_SANDBOX_BACKEND=bwrap
 Unavailable optional backends fail with a diagnostic; AEGIS never reports a
 command as sandboxed when the backend did not run.
 
-## 6. Directory contract
+## 6. Platform services
+
+The platform layer requires no additional server. It provides typed workflow
+validation, versioned workflow registration, local hybrid retrieval with source
+citation, scoped SQLite memory with optional expiry, hash-chained audit
+verification, retryable/cancellable background jobs, and evaluation metrics.
+
+Start the API to use these services:
+
+```bash
+python -m uvicorn app.api.main:app --host 127.0.0.1 --port 8000
+curl http://127.0.0.1:8000/api/audit/verify
+curl http://127.0.0.1:8000/api/evaluations/summary
+```
+
+The current API principal adapter is local-admin for the prototype. Replace it
+with OIDC/LDAP/SCIM integration before exposing the API to multiple users.
+
+## 7. SIH2026 presentation workflow
+
+The repository includes a six-slide AEGIS project presentation created from
+the supplied SIH2026 format. It preserves the original 16:9 canvas, SIH
+branding, title treatment, team oval, blue footer, and section structure.
+Use `artifact-template-sih2026-aegis-presentation` for future decks.
+
+## 8. Directory contract
 
 Active source is in `runtime/`, `tools/`, `models/`, `security/`, `storage/`,
 `pipeline/`, `app/`, `tests/`, `native/`, `config/`, and `docs/`. The controlled

@@ -34,3 +34,12 @@ network disabled by default, clears inherited environment variables, applies
 resource limits when cgroup v2 is available, supports explicit read-only bind
 mounts, and exposes a dry-run command representation. File transfer APIs accept
 only relative paths that remain under the sandbox workspace.
+
+## Platform integration
+
+External services should integrate through the FastAPI boundary or the typed
+contracts in `aegis/`, not by bypassing workspace tools. Use `ExecutionPlan`
+for workflow descriptions, `PolicyEngine` for authorization,
+`HybridKnowledgeStore` for local cited retrieval, `MemoryStore` for scoped
+state, and `AuditChain` for tamper-evident event records. The personal SIH
+presentation template does not alter the runtime API.

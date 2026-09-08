@@ -12,6 +12,7 @@ import ast
 import time
 import uuid
 import asyncio
+import difflib
 import shlex
 import re
 import tempfile
@@ -371,6 +372,7 @@ class OllamaSpecialistAgent(BaseAgent):
             re.I,
         ))
         candidate = request.context.get("path")
+        seed_files: dict[str, str] = {}
         if AgentCapability.CODING in self.descriptor.capabilities and "read_file" in self.tools:
             if not candidate and re.search(r"\b(inspect|read|open|review|fix|edit|modify|change)\b", request.task, re.I):
                 match = re.search(r"([\w./-]+\.(?:py|js|ts|rs|go|java|c|cpp|h))", request.task)
@@ -388,15 +390,36 @@ class OllamaSpecialistAgent(BaseAgent):
             if candidate and not new_file_creation:
                 try:
                     reader = self.tools["read_file"]
-                    source = reader(candidate)
+                    source = await asyncio.to_thread(reader, candidate)
                     if hasattr(source, "content"):
                         source = source.content
                     if hasattr(source, "invoke"):
                         source = source.invoke({"path": candidate})
                     if isinstance(source, dict) and source.get("ok") is False:
-                        return AgentResult(agent_execution_id=execution_id, status=AgentStatus.FAILURE,
-                                           summary="Unable to read requested source file", errors=[str(source.get("error", "read failed"))])
+                        # A typo in an existing-file request should not be
+                        # treated as a terminal tool failure before the model
+                        # gets a chance to act. Resolve only an unambiguous,
+                        # close filename match inside the approved workspace.
+                        if source.get("error") == "NotFile" and "find_files" in self.tools:
+                            listing = await asyncio.to_thread(self.tools["find_files"], f"*{candidate_path.suffix}")
+                            items = listing.get("items", []) if isinstance(listing, dict) else []
+                            names = [str(item.get("name", "")) for item in items if isinstance(item, dict)]
+                            close = difflib.get_close_matches(candidate_path.name, names, n=1, cutoff=0.72)
+                            if close:
+                                match_item = next(item for item in items if item.get("name") == close[0])
+                                match_path = Path(str(match_item.get("path", "")))
+                                workspace_root = Path(str(request.context.get("workspace_root") or Path.cwd())).resolve()
+                                try:
+                                    candidate = str(match_path.resolve().relative_to(workspace_root))
+                                except ValueError:
+                                    candidate = str(match_path)
+                                source = await asyncio.to_thread(self.tools["read_file"], candidate)
+                                evidence.append(f"filename_correction:{candidate_path.name}->{candidate}")
+                        if isinstance(source, dict) and source.get("ok") is False:
+                            return AgentResult(agent_execution_id=execution_id, status=AgentStatus.FAILURE,
+                                               summary="Unable to read requested source file", errors=[str(source.get("error", "read failed"))])
                     content = source.get("content", "") if isinstance(source, dict) else str(source)
+                    seed_files[str(candidate)] = str(content)[:3500]
                     evidence.append((f"read_file:{candidate} ({len(content)} chars)")[:4000])
                     artifacts.append(str(candidate))
                 except Exception as exc:
@@ -434,7 +457,6 @@ class OllamaSpecialistAgent(BaseAgent):
             # executes only descriptor-allowlisted tools. Approval is delegated
             # to WorkspaceReadTools; this layer never grants it implicitly.
             messages = [{"role": "user", "content": request.task}]
-            saw_read = any(item.startswith("read_file:") for item in evidence)
             invalid_actions = 0
             created_paths: set[str] = set()
             post_create_steps = 0
@@ -445,7 +467,7 @@ class OllamaSpecialistAgent(BaseAgent):
             last_tool_result: dict[str, Any] | None = None
             # Keep bounded working memory separate from the latest result so a
             # command failure cannot erase the source files needed to diagnose it.
-            known_files: dict[str, str] = {}
+            known_files: dict[str, str] = dict(seed_files)
             prior_state = request.context.get("agent_state", {})
             if not isinstance(prior_state, dict):
                 prior_state = {}
@@ -476,6 +498,7 @@ class OllamaSpecialistAgent(BaseAgent):
             ]
             rejected_creation_reads = 0
             repository_context_loaded = False
+            saw_read = any(item.startswith("read_file:") for item in evidence) or bool(known_files)
 
             def coding_state_snapshot() -> dict[str, Any]:
                 """Return compact state for a graph-level repair invocation."""
@@ -501,7 +524,7 @@ class OllamaSpecialistAgent(BaseAgent):
                     if self.progress_callback:
                         self.progress_callback({"event": "tool_requested", "agent": self.descriptor.name,
                                                 "tool": "repository_context", "arguments": {}, "status": "requested"})
-                    context_result = self.tools["repository_context"]()
+                    context_result = await asyncio.to_thread(self.tools["repository_context"])
                     if isinstance(context_result, dict) and context_result.get("ok"):
                         repository_context_loaded = True
                         evidence.append(
@@ -520,6 +543,10 @@ class OllamaSpecialistAgent(BaseAgent):
                             },
                             "git_status": context_result.get("git_status", {}).get("output", ""),
                         }
+                        if seed_files:
+                            last_tool_result["target_previews"] = {
+                                path: content[:6000] for path, content in seed_files.items()
+                            }
                         if self.progress_callback:
                             self.progress_callback({"event": "tool_result", "agent": self.descriptor.name,
                                                     "tool": "repository_context", "status": "success",
@@ -533,7 +560,7 @@ class OllamaSpecialistAgent(BaseAgent):
                 target_path = target_match.group(1).rstrip(".,:;")
                 target_path_hint = target_path
                 try:
-                    listing = self.tools["list_directory"](target_path)
+                    listing = await asyncio.to_thread(self.tools["list_directory"], target_path)
                     previews: dict[str, str] = {}
                     if isinstance(listing, dict) and listing.get("ok") and "read_file" in self.tools:
                         for item in listing.get("items", [])[:12]:
@@ -543,7 +570,7 @@ class OllamaSpecialistAgent(BaseAgent):
                             if not name.lower().endswith((".py", ".js", ".ts", ".rs", ".go", ".java", ".md", ".toml", ".json")):
                                 continue
                             relative = f"{target_path}/{name}"
-                            read_result = self.tools["read_file"](relative)
+                            read_result = await asyncio.to_thread(self.tools["read_file"], relative)
                             if isinstance(read_result, dict) and read_result.get("ok"):
                                 content = str(read_result.get("content", ""))
                                 previews[relative] = content[:6000]
@@ -558,15 +585,17 @@ class OllamaSpecialistAgent(BaseAgent):
                     }
                 except Exception as exc:
                     evidence.append(f"target_context_error:{type(exc).__name__}")
+            saw_read = any(item.startswith("read_file:") for item in evidence) or bool(known_files)
             # Target preloading is useful for a first attempt, but a repair
             # must resume from the prior failure rather than replacing it with
             # the listing result.
             if isinstance(prior_last_tool_result, dict):
                 last_tool_result = dict(prior_last_tool_result)
-            # A normal repair cycle may need read -> command -> diagnosis ->
-            # edit -> command -> final. Keep it bounded but large enough for
-            # that complete evidence-backed sequence.
-            for _ in range(8):
+            # Keep the decision loop short. Stop after a few bounded actions
+            # instead of allowing repeated recovery turns to spin.
+            max_decisions = max(4, min(8, int(os.getenv("AEGIS_MAX_CODING_DECISIONS", "8"))))
+            last_decision_marker: str | None = None
+            for _ in range(max_decisions):
                 if created_paths:
                     post_create_steps += 1
                     if post_create_steps > 4 and verification.get("status") == "verified" and not verification.get("command"):
@@ -607,6 +636,8 @@ class OllamaSpecialistAgent(BaseAgent):
                         phase_instruction = "Source evidence is already available. The next action MUST execute the baseline test or command; do not read files again."
                     elif command_executed and verification.get("status") == "failed":
                         phase_instruction = "The last command failed. Diagnose its stderr/stdout and edit the implementation or tests before retrying; do not repeat the same failed command unchanged."
+                    elif changes and verification.get("status") in {"verified", "passed"} and not requires_command:
+                        phase_instruction = "The requested file change is already read back and verified. Return action=final now; do not edit again."
                     else:
                         phase_instruction = "Use the existing evidence, make only necessary edits, rerun verification, and then finalize."
                     allowed_tools = {
@@ -666,10 +697,11 @@ class OllamaSpecialistAgent(BaseAgent):
                         self._observe_model_call()
                         stream_events = self.provider.stream_chat_events(
                             [{"role": "user", "content": coding_prompt}],
-                            # Ollama's explicit thinking channel is supported
-                            # by qwen3-style models. qwen2.5-coder still gets
-                            # native content streaming without that option.
-                            think=str(getattr(getattr(self.provider, "config", None), "model", "")).lower().startswith("qwen3"),
+                            # Thinking support is a model contract, not a
+                            # naming convention. Some qwen3 derivatives (for
+                            # example the coder build) reject the `think`
+                            # field entirely.
+                            think=bool(getattr(getattr(self.provider, "config", None), "supports_thinking", False)),
                             timeout=coding_timeout,
                         )
                         async with asyncio.timeout(coding_timeout):
@@ -699,12 +731,34 @@ class OllamaSpecialistAgent(BaseAgent):
                         response = await asyncio.wait_for(self.provider.generate(coding_prompt), timeout=coding_timeout)
                         response_content = response.content
                     action = parse_action(response_content)
+                    decision_marker = json.dumps(
+                        {"action": action, "state_version": state_version,
+                         "command_executed": command_executed,
+                         "verification": verification.get("status")},
+                        sort_keys=True, default=str,
+                    )
+                    if decision_marker == last_decision_marker:
+                        return AgentResult(
+                            agent=self.descriptor.name, agent_execution_id=execution_id,
+                            status=AgentStatus.FAILURE,
+                            summary="No progress: the same coding decision was repeated.",
+                            evidence=evidence, artifacts=artifacts, changes=changes,
+                            approvals=approvals, verification=verification,
+                            errors=["repeated_action_no_progress", "max tool steps reached"],
+                            metadata={"coding_state": coding_state_snapshot()},
+                        )
+                    last_decision_marker = decision_marker
                 except ActionParseError as exc:
                     invalid_actions += 1
                     if invalid_actions < 3:
                         # Give the local model a bounded correction opportunity;
                         # free-form prose is never executed as a tool action.
                         evidence.append(f"invalid_action:{str(exc)[:160]}")
+                        last_tool_result = {
+                            "tool": "controller", "status": "failure",
+                            "error": "invalid_action",
+                            "message": "Return exactly one JSON object using action=tool or action=final; no prose.",
+                        }
                         continue
                     return AgentResult(agent=self.descriptor.name, agent_execution_id=execution_id,
                                        status=AgentStatus.FAILURE,
@@ -787,7 +841,7 @@ class OllamaSpecialistAgent(BaseAgent):
                                 except Exception as exc:
                                     evidence.append(f"infrastructure_verification_error:{type(exc).__name__}")
                     if requires_command and (not command_executed or verification.get("status") != "passed"):
-                        if _ < 7:
+                        if _ + 1 < max_decisions:
                             evidence.append("execution_required:successful execute_command before final")
                             if self.progress_callback:
                                 self.progress_callback({"event": "repair_requested", "agent": self.descriptor.name,
@@ -909,14 +963,58 @@ class OllamaSpecialistAgent(BaseAgent):
                                                 "tool": name, "reason": hint, "retryable": True,
                                                 "error_type": "wrong_repair_target"})
                     continue
+                if name == "edit_file":
+                    edit_path = str(args.get("path", ""))
+                    needs_read = (not saw_read) or (edit_path and edit_path not in known_files)
+                    if needs_read and edit_path and "read_file" in self.tools:
+                        if self.progress_callback:
+                            self.progress_callback({"event": "tool_requested", "agent": self.descriptor.name,
+                                                    "tool": "read_file", "arguments": {"path": edit_path},
+                                                    "status": "requested"})
+                        try:
+                            readback = await asyncio.to_thread(self.tools["read_file"], edit_path)
+                        except Exception as exc:
+                            readback = {"ok": False, "status": "failure", "error": type(exc).__name__,
+                                        "message": str(exc)[:200]}
+                        if not isinstance(readback, dict):
+                            readback = {"ok": True, "content": str(readback)}
+                        if self.progress_callback:
+                            self.progress_callback({"event": "tool_result", "agent": self.descriptor.name,
+                                                    "tool": "read_file",
+                                                    "status": "success" if readback.get("ok") else "failure"})
+                        if readback.get("ok"):
+                            saw_read = True
+                            content = str(readback.get("content", ""))
+                            known_files[edit_path] = content[:3500]
+                            evidence.append(f"read_file:{edit_path} ({len(content)} chars)")
+                            artifacts.append(edit_path)
+                            last_tool_result = {"tool": "read_file", "status": "success", "ok": True,
+                                                "path": edit_path, "content": content[:6000]}
+                        else:
+                            detail = str(readback.get("error") or readback.get("message") or "read failed")[:500]
+                            evidence.append(f"failure:read_file:{detail}")
+                            last_tool_result = {"tool": "read_file", "status": "failure", "ok": False,
+                                                "error": readback.get("error", "read_failed"),
+                                                "message": "read_file is required before edit_file"}
+                            if self.progress_callback:
+                                self.progress_callback({"event": "repair_requested", "agent": self.descriptor.name,
+                                                        "tool": "read_file", "reason": detail, "retryable": True})
+                            continue
+                    elif not saw_read:
+                        evidence.append("edit-before-read blocked")
+                        last_tool_result = {"tool": "edit_file", "status": "failure", "ok": False,
+                                            "error": "edit-before-read blocked",
+                                            "message": "read_file is required before edit_file"}
+                        if self.progress_callback:
+                            self.progress_callback({"event": "repair_requested", "agent": self.descriptor.name,
+                                                    "tool": "edit_file",
+                                                    "reason": "read_file is required before edit_file",
+                                                    "retryable": False})
+                        continue
                 if self.progress_callback:
                     trace_args = {key: (f"<{len(str(value))} chars>" if key in {"old_text", "new_text", "content"} else str(value)[:240]) for key, value in args.items()}
                     self.progress_callback({"event": "tool_requested", "agent": self.descriptor.name,
                                             "tool": name, "arguments": trace_args, "status": "requested"})
-                if name == "edit_file" and not saw_read:
-                    return AgentResult(agent_execution_id=execution_id, status=AgentStatus.BLOCKED,
-                                       summary="read_file is required before edit_file", evidence=evidence,
-                                       errors=["edit-before-read blocked"])
                 if name == "edit_file":
                     edit = (str(args.get("path", "")), str(args.get("old_text", "")),
                             str(args.get("new_text", "")))
@@ -1011,7 +1109,7 @@ class OllamaSpecialistAgent(BaseAgent):
                         # remembering to verify its own write.
                         if "read_file" in self.tools:
                             try:
-                                readback = self.tools["read_file"](created_path)
+                                readback = await asyncio.to_thread(self.tools["read_file"], created_path)
                                 if isinstance(readback, dict) and readback.get("ok") and str(readback.get("content", "")).strip():
                                     saw_read = True
                                     verification["status"] = "verified"
@@ -1098,6 +1196,17 @@ class OllamaSpecialistAgent(BaseAgent):
                             except SyntaxError as exc:
                                 verification["status"] = "failed"
                                 evidence.append((f"syntax_validation:{created_path}:failed:{exc.msg}")[:4000])
+                        if (name == "edit_file"
+                                and verification.get("status") == "verified"
+                                and not requires_command):
+                            return AgentResult(
+                                agent=self.descriptor.name, agent_execution_id=execution_id,
+                                status=AgentStatus.SUCCESS,
+                                summary=f"{created_path} updated successfully",
+                                evidence=evidence, artifacts=artifacts, changes=changes,
+                                approvals=approvals, verification=verification,
+                                metadata={"coding_state": coding_state_snapshot()},
+                            )
                     elif (name in {"create_file", "create_python_script"}
                           and status != "success"
                           and result.get("error") == "file_exists"):
@@ -1112,7 +1221,7 @@ class OllamaSpecialistAgent(BaseAgent):
                         verification = {"required": True, "command": "", "status": "verified_pending"}
                         if "read_file" in self.tools:
                             try:
-                                readback = self.tools["read_file"](existing_path)
+                                readback = await asyncio.to_thread(self.tools["read_file"], existing_path)
                                 if isinstance(readback, dict) and readback.get("ok") and str(readback.get("content", "")).strip():
                                     saw_read = True
                                     verification["status"] = "verified"
@@ -1148,7 +1257,7 @@ class OllamaSpecialistAgent(BaseAgent):
                     failure = classify_failure(result)
                     detail = str(result.get("error") or result.get("message") or "tool failed")[:500]
                     evidence.append(f"failure:{name}:{detail}")
-                    if failure["retryable"] and _ < 7:
+                    if failure["retryable"] and _ + 1 < max_decisions:
                         if self.progress_callback:
                             self.progress_callback({"event": "repair_requested", "agent": self.descriptor.name,
                                                     "tool": name, "reason": detail, "retryable": True})
@@ -1157,6 +1266,17 @@ class OllamaSpecialistAgent(BaseAgent):
                                        summary=f"{name} failed", evidence=evidence, artifacts=artifacts,
                                        changes=changes, approvals=approvals, verification=verification,
                                        errors=[detail], metadata={"coding_state": coding_state_snapshot()})
+            if (changes and verification.get("status") in {"verified", "passed"}
+                    and not requires_command):
+                paths = ", ".join(str(path) for path in changes[-8:])
+                return AgentResult(
+                    agent=self.descriptor.name, agent_execution_id=execution_id,
+                    status=AgentStatus.SUCCESS,
+                    summary=f"Updated {paths} successfully",
+                    evidence=evidence, artifacts=artifacts, changes=changes,
+                    approvals=approvals, verification=verification,
+                    metadata={"coding_state": coding_state_snapshot()},
+                )
             return AgentResult(agent_execution_id=execution_id, status=AgentStatus.FAILURE,
                                summary="Coding tool loop limit reached", evidence=evidence,
                                artifacts=artifacts, changes=changes, approvals=approvals,
@@ -1172,11 +1292,87 @@ class OllamaSpecialistAgent(BaseAgent):
         )
         try:
             self._observe_model_call()
-            response = await self.provider.generate(prompt)
-            raw = response.content.strip()
+            # General requests use Ollama's native NDJSON stream.  Besides
+            # making the first answer token visible immediately, the bounded
+            # deadline prevents a stalled local model from holding the CLI for
+            # six minutes before recovery can start.
+            stream_method = getattr(type(self.provider), "stream_chat_events", None)
+            raw_parts: list[str] = []
+            if callable(stream_method):
+                timeout_seconds = max(15.0, float(os.getenv("AEGIS_MODEL_TIMEOUT_SECONDS", "90")))
+                max_tokens = max(32, int(os.getenv("AEGIS_GENERAL_MAX_TOKENS", "256")))
+                stream_events = self.provider.stream_chat_events(
+                    [{"role": "user", "content": prompt}],
+                    timeout=timeout_seconds,
+                    num_ctx=min(int(getattr(getattr(self.provider, "config", None), "context_length", 8192)), 8192),
+                    num_predict=max_tokens,
+                    temperature=0.2,
+                    think=os.getenv("SHOW_OLLAMA_THINKING", "0") == "1",
+                )
+                async with asyncio.timeout(timeout_seconds):
+                    async for item in stream_events:
+                        kind = str(item.get("kind", "content"))
+                        token = str(item.get("token", ""))
+                        if kind == "thinking":
+                            if self.progress_callback:
+                                self.progress_callback({
+                                    "event": "model_activity", "agent": self.descriptor.name,
+                                    "kind": "thinking", "token_count": len(token),
+                                })
+                            continue
+                        if token:
+                            raw_parts.append(token)
+                            if self.progress_callback:
+                                self.progress_callback({
+                                    "event": "model_activity", "agent": self.descriptor.name,
+                                    "kind": "content", "text": token,
+                                    "token_count": len(token),
+                                })
+                raw = "".join(raw_parts).strip()
+            else:
+                response = await self.provider.generate(
+                    prompt, timeout=max(15.0, float(os.getenv("AEGIS_MODEL_TIMEOUT_SECONDS", "90")))
+                )
+                raw = response.content.strip()
+            if not raw:
+                raise ValueError("Model returned no usable output")
             try:
-                data = json.loads(raw)
+                json_candidate = raw.strip()
+                if json_candidate.startswith("```"):
+                    json_candidate = re.sub(r"^```(?:json)?\s*", "", json_candidate, flags=re.I)
+                    json_candidate = re.sub(r"\s*```$", "", json_candidate)
+                data = json.loads(json_candidate)
                 if isinstance(data, dict):
+                    # Older/local prompt wrappers sometimes return the actual
+                    # answer under agent_result instead of AgentResult fields.
+                    wrapped = data.get("agent_result")
+                    if isinstance(wrapped, str):
+                        return AgentResult(
+                            agent=self.descriptor.name, agent_execution_id=execution_id,
+                            status=AgentStatus.SUCCESS, summary=wrapped.strip(),
+                            result={"provider_output": data}, evidence=evidence, artifacts=artifacts,
+                            metadata={"provider_json_wrapper": "agent_result"},
+                        )
+                    if isinstance(wrapped, dict) and isinstance(wrapped.get("task_response"), str):
+                        return AgentResult(
+                            agent=self.descriptor.name, agent_execution_id=execution_id,
+                            status=AgentStatus.SUCCESS, summary=wrapped["task_response"].strip(),
+                            result={"provider_output": data}, evidence=evidence, artifacts=artifacts,
+                            metadata={"provider_json_wrapper": "agent_result"},
+                        )
+                    # Small local models often return a concise JSON envelope
+                    # such as {"result": "pong"} rather than the full
+                    # AgentResult schema. Preserve that useful answer while
+                    # still recording that it came through a compatibility
+                    # wrapper.
+                    for key in ("answer", "message", "summary", "response", "text", "result"):
+                        if isinstance(data.get(key), str) and data[key].strip():
+                            return AgentResult(
+                                agent=self.descriptor.name, agent_execution_id=execution_id,
+                                status=AgentStatus.SUCCESS, summary=data[key].strip(),
+                                result={"provider_output": data}, evidence=evidence, artifacts=artifacts,
+                                metadata={"provider_json_wrapper": key},
+                            )
                     # Infrastructure/code controls agent_execution_id; model cannot invent or control it.
                     data["agent_execution_id"] = execution_id
                     result = AgentResult.model_validate(data)
@@ -1187,21 +1383,14 @@ class OllamaSpecialistAgent(BaseAgent):
             except (json.JSONDecodeError, ValueError):
                 pass
             
-            # Fallback for LLMs that return arbitrary JSON instead of AgentResult
-            summary = raw[:4000]
-            try:
-                data = json.loads(raw)
-                if isinstance(data, dict):
-                    # Try to find a human-readable message field
-                    for key in ("answer", "message", "summary", "response", "text"):
-                        if key in data and isinstance(data[key], str):
-                            summary = data[key]
-                            break
-            except json.JSONDecodeError:
-                pass
-                
-            return AgentResult(agent=self.descriptor.name, agent_execution_id=execution_id, status=AgentStatus.SUCCESS, summary=summary, result=raw,
-                               evidence=evidence, artifacts=artifacts)
+            # Do not convert malformed model output into a false success. It
+            # must enter the bounded recovery path with an actionable error.
+            return AgentResult(
+                agent=self.descriptor.name, agent_execution_id=execution_id,
+                status=AgentStatus.FAILURE, summary="Model returned an unstructured response.",
+                result=raw[:4000], evidence=evidence, artifacts=artifacts,
+                errors=["unstructured_model_output"],
+            )
         except Exception as exc:
             err_msg = str(exc)[:500] or type(exc).__name__
             return AgentResult(agent=self.descriptor.name, agent_execution_id=execution_id, status=AgentStatus.FAILURE, summary="Agent execution failed",
@@ -1266,7 +1455,10 @@ def build_default_agent_registry(model_registry: ModelRegistry,
         ("vision_agent", "vision and diagram specialist", "qwen-vision", [AgentCapability.VISION], ["analyze_image", "compare_images"]),
         ("document_agent", "document analysis and creation specialist", "qwen-general", [AgentCapability.DOCUMENT], ["document_runner", "ocr_pdf", "create_document", "list_documents", "inspect_document_metadata", "extract_document_text", "search_documents", "read_document_section"]),
         ("lightweight_agent", "lightweight formatting specialist", "llama-small", [AgentCapability.LIGHTWEIGHT], []),
-        ("general_agent", "general reasoning specialist", "qwen-general", [AgentCapability.GENERAL], []),
+        # Keep the interactive general route responsive. Larger models remain
+        # available for document/coding workflows and can be selected by
+        # changing the registry or routing configuration.
+        ("general_agent", "general reasoning specialist", "llama-small", [AgentCapability.GENERAL], []),
     ]
     registry = AgentRegistry()
     for name, role, provider_name, capabilities, allowed in definitions:

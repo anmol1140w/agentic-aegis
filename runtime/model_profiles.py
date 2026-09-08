@@ -18,7 +18,10 @@ class ModelProfile:
 
 
 def get_model_profile(model_id: str | None = None) -> ModelProfile:
-    model = model_id or "qwen2.5-coder:7b"
+    # The registry owns provider-specific model tags. Callers that do not have
+    # a selected provider yet get a neutral diagnostic value instead of a
+    # stale hard-coded model name.
+    model = model_id or "configured"
     return ModelProfile(
         name="aegis-5b-cpu", model_id=model,
         context_chars=int(os.getenv("AEGIS_CONTEXT_CHARS", "48000")),
