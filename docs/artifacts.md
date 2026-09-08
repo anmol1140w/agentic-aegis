@@ -19,3 +19,5 @@ Presentation artifacts follow the same verification rule. The generated
 SIH2026 project deck is six slides, preserves the supplied 16:9 theme, and is
 stored in the repository `outputs/` directory. Future decks should use the
 personal `artifact-template-sih2026-aegis-presentation` template.
+
+For the deterministic PPTX/XLSX subsystem, see [office-artifacts.md](office-artifacts.md).

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
 py-modules = ["cli"]
-packages = ["aegis", "app", "app.api", "config", "models", "routing", "runtime", "tools", "tools.ocr", "security", "storage", "pipeline", "evaluation", "ui"]
+packages = ["aegis", "app", "app.api", "config", "models", "routing", "runtime", "tools", "tools.artifacts", "tools.ocr", "security", "storage", "pipeline", "evaluation", "ui"]
 
 [project]
 name = "sih-workbench"
@@ -50,6 +50,7 @@ ocr = [
 artifacts = [
     "python-docx>=1.0.0",
     "python-pptx>=1.0.0",
+    "openpyxl>=3.1.0",
     "reportlab>=4.0.0",
 ]
 sandbox = [

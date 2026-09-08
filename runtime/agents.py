@@ -53,6 +53,9 @@ class AgentCapability(str, Enum):
     LIGHTWEIGHT = "lightweight"
     GENERAL = "general"
     VERIFICATION = "verification"
+    PRESENTATION = "presentation"
+    SPREADSHEET = "spreadsheet"
+    ARTIFACT_VALIDATION = "artifact_validation"
 
 
 def _coerce_list_of_strings(val: Any) -> list[str]:
@@ -184,6 +187,10 @@ class OllamaSpecialistAgent(BaseAgent):
         changes: list[str] = []
         approvals: list[dict[str, Any]] = []
         verification: dict[str, Any] = {"required": False, "command": "", "status": "not_run"}
+        artifact_capability = next((cap for cap in (AgentCapability.PRESENTATION, AgentCapability.SPREADSHEET)
+                                    if cap in self.descriptor.capabilities), None)
+        if artifact_capability:
+            return await self._run_artifact(request, execution_id, artifact_capability)
         # Creation is an explicit operation of the document specialist and
         # does not require an input document.
         if AgentCapability.DOCUMENT in self.descriptor.capabilities and re.search(
@@ -374,7 +381,7 @@ class OllamaSpecialistAgent(BaseAgent):
         candidate = request.context.get("path")
         seed_files: dict[str, str] = {}
         if AgentCapability.CODING in self.descriptor.capabilities and "read_file" in self.tools:
-            if not candidate and re.search(r"\b(inspect|read|open|review|fix|edit|modify|change)\b", request.task, re.I):
+            if not candidate and re.search(r"\b(inspect|read|open|review|fix|edit|modify|change|run|execute)\b", request.task, re.I):
                 match = re.search(r"([\w./-]+\.(?:py|js|ts|rs|go|java|c|cpp|h))", request.task)
                 candidate = match.group(1) if match else None
             candidate_path = Path(str(candidate)) if candidate else None
@@ -452,7 +459,13 @@ class OllamaSpecialistAgent(BaseAgent):
             request.task, re.I,
         ))
         inspection_capable = any(name in self.tools for name in ("repository_context", "tree", "search_files", "find_files"))
-        if (mutation_request or command_request or repository_request or (inspection_request and inspection_capable)) and AgentCapability.CODING in self.descriptor.capabilities:
+        # A direct "run <file>" request is still a coding execution task even
+        # when the wording does not contain the words command, script, or
+        # python. Keep it inside the tool loop so source read and command
+        # evidence are recorded before any answer is accepted.
+        direct_run_request = bool(re.search(r"\b(?:run|execute)\b", request.task, re.I))
+        if (mutation_request or command_request or direct_run_request or repository_request or
+                (inspection_request and inspection_capable)) and AgentCapability.CODING in self.descriptor.capabilities:
             # The model may propose actions, but infrastructure validates and
             # executes only descriptor-allowlisted tools. Approval is delegated
             # to WorkspaceReadTools; this layer never grants it implicitly.
@@ -1396,6 +1409,57 @@ class OllamaSpecialistAgent(BaseAgent):
             return AgentResult(agent=self.descriptor.name, agent_execution_id=execution_id, status=AgentStatus.FAILURE, summary="Agent execution failed",
                                errors=[err_msg])
 
+    async def _run_artifact(self, request: AgentRequest, execution_id: str,
+                            capability: AgentCapability) -> AgentResult:
+        """Build a bounded spec and invoke only deterministic artifact tools."""
+        artifact_type = "pptx" if capability == AgentCapability.PRESENTATION else "xlsx"
+        create_tool = "create_presentation" if artifact_type == "pptx" else "create_workbook"
+        task = request.task.strip()
+        try:
+            if re.search(r"\b(validate|inspect)\b", task, re.I) and re.search(r"\.(pptx|xlsx)\b", task, re.I):
+                path = re.search(r"([^\s`\"']+\.(?:pptx|xlsx))\b", task, re.I).group(1)
+                result = self.tools["validate_artifact"](path=path)
+            else:
+                if artifact_type == "pptx":
+                    count_match = re.search(r"\b(\d+)\s*[- ]?slide", task, re.I)
+                    count = max(1, min(int(count_match.group(1)), 30)) if count_match else 5
+                    title = re.sub(r"\s+", " ", task).strip(" .")[:90] or "AEGIS Presentation"
+                    slides = [{"layout": "title", "title": title, "subtitle": "Generated locally by AEGIS"}]
+                    slides += [{"layout": "content", "title": f"AEGIS overview {index}", "bullets": ["Local-first execution", "Capability-based routing", "Deterministic validation"]} for index in range(2, count + 1)]
+                    spec = {"title": title, "subtitle": "Sovereign AI Workbench", "theme": "professional", "slides": slides}
+                else:
+                    spec = {"title": task[:90] or "AEGIS Workbook", "worksheets": [{
+                        "name": "Summary", "headers": ["Month", "Category", "Amount"],
+                        "rows": [["January", "Operations", 0], ["February", "Operations", 0], ["March", "Operations", 0], ["April", "Operations", 0]],
+                        "table": {"name": "ExpenseTable"}, "freeze_panes": "A2",
+                        "charts": [{"type": "column", "title": "Monthly expenses", "data_range": "A1:C5", "anchor": "E2"}],
+                    }]}
+                requested_path = re.search(r"(?:save|write|export|output)\s+(?:the\s+)?(?:file\s+)?(?:to|at)\s+([^\s`\"']+\.(?:pptx|xlsx))\b", task, re.I)
+                if requested_path:
+                    output = requested_path.group(1)
+                else:
+                    output_root = Path(str(request.context.get("workspace_root") or Path.cwd())) / "outputs" / "artifacts"
+                    output_root.mkdir(parents=True, exist_ok=True)
+                    output = output_root / f"{artifact_type}_{uuid.uuid4().hex[:10]}.{artifact_type}"
+                result = self.tools[create_tool](spec=spec, output_path=str(output))
+            if not isinstance(result, dict) or result.get("status") not in {"success", "passed"}:
+                errors = result.get("errors", ["artifact_operation_failed"]) if isinstance(result, dict) else ["artifact_operation_failed"]
+                return AgentResult(agent=self.descriptor.name, agent_execution_id=execution_id,
+                                   status=AgentStatus.FAILURE, summary="Artifact operation failed",
+                                   result=result, errors=[str(error) for error in errors],
+                                   verification={"required": True, "status": "failed"})
+            path = str(result.get("path", ""))
+            validation = result.get("validation", result)
+            return AgentResult(agent=self.descriptor.name, agent_execution_id=execution_id,
+                               status=AgentStatus.SUCCESS, summary=f"Created and validated {artifact_type.upper()} artifact",
+                               result=result, artifacts=[path] if path else [], evidence=["deterministic artifact tool", "parsed and validated output"],
+                               verification={"required": True, "status": "passed", "artifact_type": artifact_type, "validation": validation},
+                               metadata={"artifact_type": artifact_type, "structured_spec": True})
+        except Exception as exc:
+            return AgentResult(agent=self.descriptor.name, agent_execution_id=execution_id,
+                               status=AgentStatus.FAILURE, summary="Artifact operation failed",
+                               errors=[f"artifact_generation_failed:{type(exc).__name__}"])
+
 
 class AgentRegistry:
     """Registry queried by capability; model identifiers stay in descriptors."""
@@ -1454,6 +1518,8 @@ def build_default_agent_registry(model_registry: ModelRegistry,
          ["list_directory", "tree", "read_file", "search_files", "find_files", "get_file_info", "repository_context", "git_status", "git_diff", "list_skills", "read_skill", "workspace_diff", "list_checkpoints", "edit_file", "create_file", "create_python_script", "execute_command", "create_checkpoint", "restore_checkpoint"]),
         ("vision_agent", "vision and diagram specialist", "qwen-vision", [AgentCapability.VISION], ["analyze_image", "compare_images"]),
         ("document_agent", "document analysis and creation specialist", "qwen-general", [AgentCapability.DOCUMENT], ["document_runner", "ocr_pdf", "create_document", "list_documents", "inspect_document_metadata", "extract_document_text", "search_documents", "read_document_section"]),
+        ("presentation_agent", "PowerPoint generation and editing specialist", "qwen-general", [AgentCapability.PRESENTATION, AgentCapability.ARTIFACT_VALIDATION], ["create_presentation", "edit_artifact", "validate_artifact"]),
+        ("spreadsheet_agent", "Excel workbook generation and editing specialist", "qwen-general", [AgentCapability.SPREADSHEET, AgentCapability.ARTIFACT_VALIDATION], ["create_workbook", "edit_artifact", "validate_artifact"]),
         ("lightweight_agent", "lightweight formatting specialist", "llama-small", [AgentCapability.LIGHTWEIGHT], []),
         # Keep the interactive general route responsive. Larger models remain
         # available for document/coding workflows and can be selected by
@@ -1525,6 +1591,12 @@ class MasterAgent:
         self.capability_matcher = capability_matcher or CapabilityMatcher([
             CapabilityProfile("document_creation", "create new documents and save DOCX, PDF, Markdown, or TXT artifacts", "document_agent", "document", ("docx", "pdf", "markdown", "md", "txt")),
             CapabilityProfile("document_analysis", "inspect PDFs, reports, OCR text, and extract findings", "document_agent", "document", ("json", "docx")),
+            CapabilityProfile("presentation_generation", "create, edit, and validate PowerPoint PPTX slide presentations", "presentation_agent", "text", ("pptx", "powerpoint", "slides")),
+            CapabilityProfile("presentation_editing", "modify PowerPoint slides, text, tables, and charts", "presentation_agent", "text", ("pptx",)),
+            CapabilityProfile("spreadsheet_generation", "create, edit, and validate Excel XLSX workbooks, formulas, tables, and charts", "spreadsheet_agent", "text", ("xlsx", "excel", "spreadsheet")),
+            CapabilityProfile("spreadsheet_editing", "modify Excel worksheets, formulas, tables, and charts", "spreadsheet_agent", "text", ("xlsx",)),
+            CapabilityProfile("artifact_validation", "validate local PPTX and XLSX package structure and expected content", "presentation_agent", "text", ("pptx", "xlsx")),
+            CapabilityProfile("calculation", "answer bounded arithmetic and mathematical formula requests", "general_agent", "text", ("formula", "number", "calculation")),
             CapabilityProfile("p_and_id_analysis", "analyze P&ID process diagrams and engineering drawings", "vision_agent", "image", ("json",)),
             CapabilityProfile("code_debugging", "read, debug, edit source code and run tests", "coding_agent", "text", ("patch",)),
             CapabilityProfile("general_reasoning", "answer general questions and summarize information", "general_agent", "text", ("text",)),
@@ -1571,13 +1643,17 @@ class MasterAgent:
         """Build only capability-compatible specialist candidates."""
         text = request.lower()
         candidates: list[RoutingCandidate] = []
-        for name in ("document_agent", "vision_agent", "coding_agent", "general_agent"):
+        for name in ("presentation_agent", "spreadsheet_agent", "document_agent", "vision_agent", "coding_agent", "general_agent"):
             try:
                 descriptor = self.registry.get(name).descriptor
             except Exception:
                 continue
             compatible = True
-            if baseline.get("capability") == "psu_approval_note":
+            if baseline.get("capability", "").startswith("presentation") or baseline.get("capability") == "artifact_validation" or re.search(r"pptx?|powerpoint|slide|presentation", text):
+                compatible = name == "presentation_agent"
+            elif baseline.get("capability", "").startswith("spreadsheet") or re.search(r"xlsx|excel|spreadsheet|workbook|budget tracker", text):
+                compatible = name == "spreadsheet_agent"
+            elif baseline.get("capability") == "psu_approval_note":
                 compatible = name == "document_agent"
             elif re.search(r"p&id|diagram|visual|image", text):
                 compatible = name in {"vision_agent", "document_agent"}
@@ -1607,6 +1683,20 @@ class MasterAgent:
     def _capability_plan(self, request: str) -> list[dict[str, Any]]:
         """Master-owned capability selection used when model planning is unavailable."""
         text = request.lower()
+        if re.search(r"\b(?:what(?:'s|s| is)\s+)?(?:the\s+)?sum\s+of\s+(?:the\s+)?first\s+n\s+(?:positive\s+)?numbers?\b|\bsum\s+from\s+1\s+to\s+n\b", text):
+            return [{"agent": "general_agent", "task": request,
+                     "capability": "calculation",
+                     "success_criteria": ["deterministic formula for the sum of integers from 1 through n"]}]
+        presentation_intent = bool(re.search(r"\b(pptx?|powerpoint|presentation|slide deck|slides?)\b", text))
+        spreadsheet_intent = bool(re.search(r"\b(xlsx|excel|spreadsheet|workbook|budget tracker|expense tracker)\b", text))
+        if presentation_intent:
+            return [{"agent": "presentation_agent", "task": request,
+                     "capability": "presentation_editing" if re.search(r"\b(edit|modify|update|add|remove)\b", text) else "presentation_generation",
+                     "success_criteria": ["validated PPTX artifact in workspace"]}]
+        if spreadsheet_intent:
+            return [{"agent": "spreadsheet_agent", "task": request,
+                     "capability": "spreadsheet_editing" if re.search(r"\b(edit|modify|update|add|remove)\b", text) else "spreadsheet_generation",
+                     "success_criteria": ["validated XLSX artifact in workspace"]}]
         if re.search(r"\b(what\s+is|explain|define)\b", text) and re.search(
             r"\b(refinery\s+approval\s+note|psu\s+approval\s+note|office\s+note)\b", text
         ):

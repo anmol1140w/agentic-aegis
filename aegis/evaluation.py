@@ -23,6 +23,36 @@ class EvaluationRecord:
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass
+class TrajectoryRecord:
+    """Evaluation dimensions for agent behavior, not only final answers."""
+    task_id: str
+    expected_tools: list[str] = field(default_factory=list)
+    actual_tools: list[str] = field(default_factory=list)
+    latency_ms: float = 0.0
+    tokens: int = 0
+    completed: bool = False
+    policy_violations: int = 0
+    retries: int = 0
+
+    def score(self) -> dict[str, float]:
+        expected = self.expected_tools
+        actual = self.actual_tools
+        correct_tools = sum(tool in expected for tool in actual) if expected else 1
+        precision = correct_tools / len(actual) if actual else (1.0 if not expected else 0.0)
+        recall = sum(tool in actual for tool in expected) / len(expected) if expected else 1.0
+        return {
+            "completion": float(self.completed),
+            "tool_precision": precision,
+            "tool_recall": recall,
+            "tool_efficiency": 1.0 / max(1, len(actual)),
+            "latency_ms": self.latency_ms,
+            "tokens": float(self.tokens),
+            "policy_violations": float(self.policy_violations),
+            "retries": float(self.retries),
+        }
+
+
 class EvaluationSuite:
     def __init__(self, path: str | Path = ".aegis/evaluations.jsonl") -> None:
         self.path = Path(path)

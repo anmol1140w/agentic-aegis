@@ -93,6 +93,7 @@ class TaskRunState(TypedDict, total=False):
     mutation_count: int
     messages: list[Any]
     step_results: Annotated[list[dict[str, Any]], _append]
+    artifacts: Annotated[list[str], _append]
     verification: dict[str, Any]
     verification_results: list[dict[str, Any]]
     observations: Annotated[list[dict[str, Any]], _append]

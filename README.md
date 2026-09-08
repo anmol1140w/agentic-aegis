@@ -127,4 +127,5 @@ The suite is offline by default. Live Ollama tests are opt-in. Run
 - [docs/security.md](docs/security.md) — boundaries and approvals.
 - [docs/aegis-api.md](docs/aegis-api.md) — local FastAPI interface.
 - [docs/aegis-platform.md](docs/aegis-platform.md) — typed plans, governance, retrieval, memory, jobs, and evaluation.
+- [docs/agentic-rebuild.md](docs/agentic-rebuild.md) — architecture decisions derived from the supplied production-agentic references.
 - [docs/native-boundary.md](docs/native-boundary.md) — optional C++ process helper.

@@ -177,6 +177,8 @@ class TerminalUI:
                           "  /models   configured model IDs and health\n"
                           "  /network  local network and tool counters\n"
                           "  /sandbox  sandbox preflight and policy check\n"
+                          "  /validate-artifact <path>  validate a local PPTX/XLSX\n"
+                          "  /artifacts  list generated PPTX/XLSX files\n"
                           "  /status   operating policy\n"
                           "  /debug    toggle detailed operational output\n"
                           "  /clear    clear the terminal\n"

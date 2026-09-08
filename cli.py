@@ -26,7 +26,6 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.rule import Rule
 from rich.table import Table
-from rich.text import Text
 from rich.theme import Theme
 
 # Ensure project root is on sys.path
@@ -42,6 +41,7 @@ from security.audit import AuditLogger
 from security.network import NetworkMonitor
 from tools.workspace import WorkspaceReadTools
 from tools.files import set_workspace_root
+from tools.artifacts import ArtifactError, ArtifactService
 from ui.terminal import TerminalUI, AEGIS_THEME
 
 # ---------------------------------------------------------------------------
@@ -63,88 +63,6 @@ def _print_banner() -> None:
     console.print("[accent]AEGIS[/accent]")
     console.print("[muted]Sovereign AI Workbench[/muted]")
     console.print(Rule(style="dim"))
-
-
-def _print_session_header(session_id: str, availability: dict[str, bool], registry: ModelRegistry) -> None:
-    """Render the session line and registry-driven model table."""
-    terminal_ui.session(session_id)
-    terminal_ui.models(registry, availability)
-
-
-def _print_result_summary(result: dict[str, Any]) -> None:
-    status = str(result.get("status", "unknown"))
-    style = "success" if status in {"completed", "success", "verified"} else "warning"
-    table = Table(show_header=False, box=None, padding=(0, 2))
-    table.add_column(style="dim", width=18)
-    table.add_column()
-    table.add_row("Status", f"[{style}]{status.upper()}[/{style}]")
-    task = result.get("task", {}) or {}
-    table.add_row("Domain intent", str(task.get("domain_intent", "general")))
-    table.add_row("Workflow", str(task.get("workflow", "general_reasoning")))
-    capabilities = task.get("required_capabilities", []) or []
-    table.add_row("Capabilities", ", ".join(map(str, capabilities)) or "—")
-    table.add_row("Specialist", result.get("selected_agent") or "—")
-    table.add_row("Selected model", result.get("selected_model") or "—")
-    table.add_row("Verification", str(result.get("verification", {}).get("status", "not run")))
-    table.add_row("Policy gateway", "checked")
-    table.add_row("Approval", "required" if task.get("requires_human_approval") else "not required")
-    repairs = result.get("repair_history", [])
-    table.add_row("Repairs", str(len(repairs)))
-    if result.get("checkpoint_store"):
-        table.add_row("Checkpoints", str(result["checkpoint_store"]))
-    if result.get("output_dir"):
-        table.add_row("Run artifacts", str(result["output_dir"]))
-    console.print(Panel(table, title="[bold bright_cyan]Run Summary[/bold bright_cyan]", border_style="bright_cyan"))
-
-
-def _print_task_info(
-    task_data: dict[str, Any] | Task,
-    model_name: str,
-    model_id: str,
-    reason: str,
-    is_direct_tool: bool = False,
-) -> None:
-    """Show classification, modality, routing, and execution mode."""
-    if isinstance(task_data, Task):
-        task_dict = task_data.to_serializable_dict()
-    else:
-        task_dict = task_data
-
-    table = Table(show_header=False, box=None, padding=(0, 2))
-    table.add_column(style="dim", width=16)
-    table.add_column()
-
-    table.add_row("Task type", f"[bold]{task_dict.get('task_type', 'general')}[/bold]")
-    table.add_row("Modality", task_dict.get("modality", "text"))
-    table.add_row("Execution mode", f"[bold]{task_dict.get('execution_mode', 'model')}[/bold]")
-
-    if is_direct_tool:
-        tool_name = task_dict.get("direct_tool_name", "tool")
-        table.add_row("Direct tool", f"[tool]{tool_name}[/tool]")
-    else:
-        table.add_row("Model", f"[model]{model_name}[/model] ({model_id})")
-
-    attached = task_dict.get("attached_files", [])
-    if attached:
-        table.add_row("Attached files", ", ".join(attached))
-
-    tools = task_dict.get("requires_tools", [])
-    if tools and not is_direct_tool:
-        table.add_row("Tools bound", ", ".join(tools))
-
-    console.print(Panel(table, title="[dim]Task Analysis & Routing[/dim]", border_style="dim", padding=(0, 1)))
-
-
-def _print_trace(traces: list[dict[str, Any]], total_ms: float | None = None) -> None:
-    """Show execution trace with phase timings."""
-    for t in traces:
-        dur = f" ({t['duration_ms']:.1f}ms)" if t.get("duration_ms") is not None else ""
-        step = t.get("step", "")
-        msg = t.get("message", "")
-        console.print(f"  [step]✓ {step}:[/step] {msg}{dur}")
-
-    if total_ms is not None:
-        console.print(f"  [bold green]Total latency:[/bold green] [dim]{total_ms:.1f}ms[/dim]")
 
 
 def _print_network(network: NetworkMonitor) -> None:
@@ -175,6 +93,34 @@ async def _handle_slash_command(raw_input: str, registry: ModelRegistry, network
         return "handled"
     if command == "/network":
         _print_network(network)
+        return "handled"
+    if command.startswith("/validate-artifact") or command.startswith("/inspect-artifact"):
+        parts = raw_input.strip().split(maxsplit=1)
+        if len(parts) != 2 or not parts[1].strip():
+            console.print("[warning]Usage: /validate-artifact <workspace-relative .pptx/.xlsx path>[/warning]")
+            return "handled"
+        try:
+            result = ArtifactService(_WORKSPACE_ROOT).validate(parts[1].strip())
+            style = "success" if result.get("status") == "passed" else "error"
+            console.print(Panel(
+                f"[{style}]{result.get('status', 'failed').upper()}[/{style}]\n"
+                f"Type: {result.get('artifact_type', 'unknown')}\n"
+                f"Path: {parts[1].strip()}\n"
+                f"Details: {result}",
+                title="[bold bright_cyan]Artifact Validation[/bold bright_cyan]",
+                border_style="green" if style == "success" else "red",
+            ))
+        except (ArtifactError, OSError) as exc:
+            console.print(f"[error]Artifact validation denied: {exc}[/error]")
+        return "handled"
+    if command == "/artifacts":
+        artifacts_root = _WORKSPACE_ROOT / "outputs" / "artifacts"
+        files = sorted(path for path in artifacts_root.rglob("*") if path.is_file()) if artifacts_root.exists() else []
+        if not files:
+            console.print("[muted]No generated PPTX/XLSX artifacts found.[/muted]")
+        else:
+            for path in files[-30:]:
+                console.print(f"  [success]✓[/success] {path.relative_to(_WORKSPACE_ROOT)} ({path.stat().st_size} bytes)")
         return "handled"
     if command == "/sandbox":
         # Probe the same canonical workspace used by the production agent.
@@ -246,10 +192,7 @@ async def _run() -> None:
     # Health check
     console.print("[muted]Checking local model availability...[/muted]")
     availability = await registry.check_availability()
-    any_available = False
-    for available in availability.values():
-        if available:
-            any_available = True
+    any_available = any(availability.values())
 
     if not any_available:
         console.print(
@@ -276,189 +219,96 @@ async def _run() -> None:
     terminal_ui.session(thread_id)
     console.print(Rule("ready", style="dim"))
 
-    while True:
-        try:
-            user_input = console.input("[cyan]you[/cyan] [dim]>[/dim] ").strip()
-        except (EOFError, KeyboardInterrupt):
-            console.print("\n[info]Goodbye.[/info]")
-            break
-
-        if not user_input:
-            continue
-
-        command_result = await _handle_slash_command(user_input, registry, network)
-        if command_result == "exit":
-            break
-        if command_result == "handled":
-            continue
-        if command_result == "master":
-            master_mode = True
-            continue
-
-        # Every request uses the same Master implementation. `/master` is only
-        # an explicit alias, never a second execution path or fallback.
-        if master_mode:
-            master_mode = False
-        if user_input.lower().startswith("/master "):
-            user_input = user_input[8:].strip()
-
-        try:
-            def _master_progress(event: dict[str, Any]) -> None:
-                terminal_ui.event(event)
-                return
-                name = str(event.get("event", "")).replace("_", " ").title()
-                if name in {"Preprocessing Started", "Preprocessing Completed"}:
-                    return
-                if name == "Master Plan":
-                    console.print("  [step]… Master planning[/step]")
-                elif name == "Capability Discovery":
-                    caps = ", ".join(map(str, event.get("required_capabilities", []))) or "general"
-                    intent = event.get("domain_intent", "general")
-                    workflow = event.get("workflow", "general_reasoning")
-                    quality = event.get("quality_required") or 0.80
-                    console.print(f"  [step]✓ Capability route: {intent} → {workflow}[/step]")
-                    console.print(f"    [dim]required={caps}  quality≥{quality:.2f}[/dim]")
-                elif name == "Plan Created":
-                    console.print("  [step]… Master planning[/step]")
-                elif name == "Plan Validated":
-                    console.print("  [step]✓ Plan validated[/step]")
-                elif name == "Policy Gateway":
-                    approval = " approval_required" if event.get("approval_required") else ""
-                    console.print(f"  [step]✓ Policy gateway checked: {event.get('action', 'action')}{approval}[/step]")
-                elif name == "Approval Checkpoint":
-                    console.print(f"  [warning]⚠ Human approval checkpoint: {event.get('action', 'action')}[/warning]")
-                elif name == "Checkpoint Persisted":
-                    console.print(f"  [dim cyan]▣ checkpoint persisted: {event.get('node', 'node')}[/dim cyan]")
-                elif name == "Specialist Execution":
-                    console.print(f"  [step]⏳ {event.get('agent', 'specialist')} working…[/step]")
-                elif name == "Model Activity":
-                    # Coding-agent model output is an internal structured
-                    # decision stream, not user-facing text. Keep the actual
-                    # stream for action parsing, but do not flood the CLI with
-                    # token-count progress lines.
-                    if event.get("agent") == "coding_agent":
-                        return
-                    kind = event.get("kind", "inference")
-                    console.print(f"  [dim cyan]⋯ {event.get('agent', 'model')} streaming {kind} ({event.get('token_count', 0)} chars)[/dim cyan]")
-                elif name == "Step Succeeded":
-                    console.print("  [step]✓ Specialist result recorded[/step]")
-                elif name == "Verification Passed":
-                    console.print("  [step]✓ Deterministic verification passed[/step]")
-                elif name == "Verification Failed":
-                    console.print("  [warning]⚠ Deterministic verification failed[/warning]")
-                elif name == "Repair Requested":
-                    console.print("  [warning]↻ Master applying bounded repair[/warning]")
-                elif name == "Repair Rejected":
-                    console.print("  [warning]⚠ No compatible repair available[/warning]")
-                elif name == "Run Failed":
-                    console.print("  [error]✗ Task failed safely[/error]")
-                elif name == "Sandbox Preflight":
-                    console.print("  [dim white]◇ sandbox preflight: checking local execution boundary…[/dim white]")
-                elif name == "Command Started":
-                    console.print(f"  [bright_white]▶ command running inside sandbox[/bright_white]  [dim]{event.get('command', '')}[/dim]")
-                elif name == "Command Finished":
-                    exit_code = event.get("exit_code")
-                    state_style = "dim white" if event.get("status") == "success" and exit_code == 0 else "warning"
-                    console.print(f"  [{state_style}]■ command stopped[/{state_style}]  exit_code={exit_code}  sandbox={event.get('sandbox', {}).get('status', 'unknown') if isinstance(event.get('sandbox'), dict) else 'unknown'}")
-                    stdout = str(event.get("stdout_preview", "")).strip()
-                    stderr = str(event.get("stderr_preview", "")).strip()
-                    if stdout:
-                        console.print(f"    [dim white]stdout › {stdout[:240]}[/dim white]")
-                    if stderr:
-                        console.print(f"    [dim yellow]stderr › {stderr[:240]}[/dim yellow]")
-                elif name == "Command Output":
-                    channel = event.get("stream", "stdout")
-                    style = "dim white" if channel == "stdout" else "dim yellow"
-                    text = str(event.get("text", "")).rstrip()
-                    if text:
-                        console.print(f"    [{style}]{channel} › {text[:240]}[/{style}]")
-                elif name == "Master Delegate":
-                    console.print(f"  [step]→ Delegating to {event.get('agent', 'specialist')}[/step]")
-                elif name == "Agent Start":
-                    console.print(f"  [step]⏳ {event.get('agent', 'specialist')} working…[/step]")
-                elif name == "Agent Complete":
-                    console.print(f"  [step]✓ {event.get('agent', 'specialist')} completed[/step]")
-                elif name == "Tool Requested":
-                    tool_name = event.get("tool", "tool")
-                    args = event.get("arguments", {})
-                    summary = " ".join(f"{key}={value}" for key, value in args.items())
-                    console.print(f"  [tool]→ {tool_name}[/tool]" + (f"  [dim]{summary[:240]}[/dim]" if summary else ""))
-                elif name == "Tool Result":
-                    status = str(event.get("status", "unknown"))
-                    style = "success" if status == "success" else "warning"
-                    detail = f"exit_code={event.get('exit_code')}" if event.get("exit_code") is not None else status
-                    console.print(f"  [{style}]■ {event.get('tool', 'tool')} {detail}[/{style}]")
-                    stderr = str(event.get("stderr_preview", "")).strip()
-                    if stderr:
-                        console.print(f"    [dim yellow]stderr › {stderr[:240]}[/dim yellow]")
-                elif name == "Repair Requested":
-                    console.print(f"  [warning]↻ {event.get('agent', 'agent')} diagnosing failure and replanning[/warning]")
-                elif name == "Master Review":
-                    console.print("  [step]✓ Master reviewing result[/step]")
-                elif name == "Master Replan":
-                    console.print("  [warning]↻ Master replanning after specialist result[/warning]")
-                elif name == "Final":
-                    console.print("  [step]✓ Final response prepared[/step]")
-
-            terminal_ui.request(user_input)
-            # Do not wrap the run in Rich's live spinner: approval prompts use
-            # stdin and must remain visible/interactive on every terminal.
-            def _live_progress(event: dict[str, Any]) -> None:
-                _master_progress(event)
-            master_result = await orchestrator.run_master(user_input, progress_callback=_live_progress)
-            prep = master_result.get("preprocessing", {})
-            if prep:
-                meta = prep.get("metadata", {})
-                console.print(
-                    f"  [step]✓ NLP preprocessing:[/step] "
-                    f"{meta.get('normalization_count', 0)} corrections, "
-                    f"{meta.get('entity_count', 0)} entities, "
-                    f"{meta.get('processing_duration_ms', 0):.1f}ms"
-                )
-            raw_answer = str(master_result.get("final_answer", "Master could not complete the request."))
-            # Sanitize: if the model returned a raw task-spec JSON blob as the
-            # answer (keys like "operation", "original_request", etc.), replace
-            # it with a human-readable fallback so the panel is readable.
+    try:
+        while True:
             try:
-                import json as _j
-                _parsed = _j.loads(raw_answer.strip())
-                _machine = isinstance(_parsed, dict) and bool(
-                    {"operation", "original_request", "normalized_request",
-                     "agent", "domain_intent", "workflow"} & _parsed.keys()
-                )
-            except Exception:
-                _machine = False
-            if _machine:
-                _changes = master_result.get("agent_results", [{}])[-1].get("changes", []) if master_result.get("agent_results") else []
-                _arts = master_result.get("agent_results", [{}])[-1].get("artifacts", []) if master_result.get("agent_results") else []
-                if _changes:
-                    answer = "Modified: " + ", ".join(str(p) for p in _changes[:6]) + "."
-                elif _arts:
-                    answer = "Produced: " + ", ".join(str(a) for a in _arts[:4]) + "."
-                else:
-                    answer = "Task completed. See output directory for artifacts."
-            else:
-                answer = raw_answer
-            terminal_ui.result(master_result, answer)
-            console.print()
-            continue
-        except KeyboardInterrupt:
-            # Ctrl-C cancels the active model/tool request and returns to the
-            # terminal prompt.  It must not print an asyncio traceback or tear
-            # down the whole REPL; this is the CLI equivalent of the reference
-            # runtimes' abort signal.
-            console.print("\n[warning]Request cancelled.[/warning] Returning to the terminal prompt.")
-            continue
-        except asyncio.CancelledError:
-            console.print("\n[warning]Request cancelled.[/warning] Returning to the terminal prompt.")
-            continue
-        except Exception as exc:
-            console.print(f"[error]Master execution failed: {exc}[/error]")
-            continue
+                user_input = console.input("[cyan]you[/cyan] [dim]>[/dim] ").strip()
+            except (EOFError, KeyboardInterrupt):
+                console.print("\n[info]Goodbye.[/info]")
+                break
 
-    # Cleanup
-    _print_network(network)
-    audit.close()
+            if not user_input:
+                continue
+
+            command_result = await _handle_slash_command(user_input, registry, network)
+            if command_result == "exit":
+                break
+            if command_result == "handled":
+                continue
+            if command_result == "master":
+                master_mode = True
+                continue
+
+            # Every request uses the same Master implementation. `/master` is only
+            # an explicit alias, never a second execution path or fallback.
+            if master_mode:
+                master_mode = False
+            if user_input.lower().startswith("/master "):
+                user_input = user_input[8:].strip()
+
+            try:
+                def _master_progress(event: dict[str, Any]) -> None:
+                    """Forward orchestration events to the centralized terminal UI."""
+                    terminal_ui.event(event)
+
+                terminal_ui.request(user_input)
+                # Do not wrap the run in Rich's live spinner: approval prompts use
+                # stdin and must remain visible/interactive on every terminal.
+                master_result = await orchestrator.run_master(user_input, progress_callback=_master_progress)
+                prep = master_result.get("preprocessing", {})
+                if prep:
+                    meta = prep.get("metadata", {})
+                    console.print(
+                        f"  [step]✓ NLP preprocessing:[/step] "
+                        f"{meta.get('normalization_count', 0)} corrections, "
+                        f"{meta.get('entity_count', 0)} entities, "
+                        f"{meta.get('processing_duration_ms', 0):.1f}ms"
+                    )
+                raw_answer = str(master_result.get("final_answer", "Master could not complete the request."))
+                # Sanitize: if the model returned a raw task-spec JSON blob as the
+                # answer (keys like "operation", "original_request", etc.), replace
+                # it with a human-readable fallback so the panel is readable.
+                try:
+                    import json as _j
+                    _parsed = _j.loads(raw_answer.strip())
+                    _machine = isinstance(_parsed, dict) and bool(
+                        {"operation", "original_request", "normalized_request",
+                         "agent", "domain_intent", "workflow"} & _parsed.keys()
+                    )
+                except Exception:
+                    _machine = False
+                if _machine:
+                    _changes = master_result.get("agent_results", [{}])[-1].get("changes", []) if master_result.get("agent_results") else []
+                    _arts = master_result.get("agent_results", [{}])[-1].get("artifacts", []) if master_result.get("agent_results") else []
+                    if _changes:
+                        answer = "Modified: " + ", ".join(str(p) for p in _changes[:6]) + "."
+                    elif _arts:
+                        answer = "Produced: " + ", ".join(str(a) for a in _arts[:4]) + "."
+                    else:
+                        answer = "Task completed. See output directory for artifacts."
+                else:
+                    answer = raw_answer
+                terminal_ui.result(master_result, answer)
+                console.print()
+                continue
+            except KeyboardInterrupt:
+                # Ctrl-C cancels the active model/tool request and returns to the
+                # terminal prompt.  It must not print an asyncio traceback or tear
+                # down the whole REPL; this is the CLI equivalent of the reference
+                # runtimes' abort signal.
+                console.print("\n[warning]Request cancelled.[/warning] Returning to the terminal prompt.")
+                continue
+            except asyncio.CancelledError:
+                console.print("\n[warning]Request cancelled.[/warning] Returning to the terminal prompt.")
+                continue
+            except Exception as exc:
+                console.print(f"[error]Master execution failed: {exc}[/error]")
+                continue
+
+    finally:
+        # Cleanup
+        _print_network(network)
+        audit.close()
 
 
 def main() -> None:

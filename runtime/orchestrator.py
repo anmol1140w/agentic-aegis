@@ -45,6 +45,7 @@ from tools.ocr import extract_ocr
 from tools.filesystem import FilesystemTools
 from tools.workspace import WorkspaceReadTools
 from tools.documents import DocumentTools
+from tools.artifacts import ArtifactService
 from tools.vision import VisionRuntime
 from tools.permissions import AccessMode, SessionPermissions
 from tools.registry import ToolRegistry
@@ -54,6 +55,8 @@ from runtime.official_documents import OfficialDocumentWorkflow
 from routing.approval_note import ApprovalNote
 from routing.adaptive_router import ContextualBanditRouter, SQLiteBanditStore
 from evaluation.routing import reward_for_outcome
+from aegis.memory import MemoryStore
+from aegis.evaluation import EvaluationRecord, EvaluationSuite, TrajectoryRecord
 
 _SYSTEM_PROMPT = SYSTEM_PROMPT
 _TOOL_LOOP_PROMPT = TOOL_LOOP_PROMPT
@@ -89,6 +92,8 @@ class Orchestrator:
         self.workspace_root = Path(workspace_root or self.output_store.workspace_dir).resolve()
         self.graph_state_store = SQLiteGraphStateStore(self.workspace_root / ".aegis" / "runs.db")
         self.telemetry_store = SQLiteTelemetryStore(self.workspace_root / ".aegis" / "runs.db")
+        self.memory = MemoryStore(self.workspace_root / ".aegis" / "memory.sqlite3")
+        self.evaluations = EvaluationSuite(self.workspace_root / ".aegis" / "evaluations.jsonl")
         self.adaptive_router = ContextualBanditRouter(
             store=SQLiteBanditStore(self.workspace_root / ".aegis" / "runs.db")
         )
@@ -112,6 +117,7 @@ class Orchestrator:
             command_approver=self._command_approver,
         )
         self.document_tools = DocumentTools(self.output_store.workspace_dir)
+        self.artifacts = ArtifactService(self.workspace_root, audit=self.audit)
         try:
             vision_provider = registry.get_provider("qwen-vision")
         except KeyError:
@@ -139,6 +145,15 @@ class Orchestrator:
             name="write_official_document", filesystem="deliverables_only",
             requires_approval=True, max_output=20_000,
         ))
+        for artifact_tool in ("create_presentation", "create_workbook", "edit_artifact"):
+            self.policy_engine.register(ToolPolicy(
+                name=artifact_tool, filesystem="workspace_only", requires_approval=True,
+                timeout=90.0, max_output=20_000,
+            ))
+        self.policy_engine.register(ToolPolicy(
+            name="validate_artifact", filesystem="workspace_only", requires_approval=False,
+            timeout=30.0, max_output=20_000,
+        ))
         # Capability-driven specialist tools are wrapped by the canonical
         # policy gateway. MCP remains an optional transport adapter and is not
         # constructed here because normal execution does not require it.
@@ -164,6 +179,10 @@ class Orchestrator:
                 "read_document_section": self.document_tools.read_document_section,
                 "analyze_image": self.vision_runtime.analyze_image,
                 "compare_images": self.vision_runtime.compare_images,
+                "create_presentation": self.artifacts.create_presentation,
+                "create_workbook": self.artifacts.create_workbook,
+                "edit_artifact": self.artifacts.edit,
+                "validate_artifact": self.artifacts.validate,
             }
         self.agent_registry = build_default_agent_registry(
             registry,
@@ -217,10 +236,17 @@ class Orchestrator:
                 request_context.setdefault("path", candidate)
         previous_callback = self.master_agent.progress_callback
         self.master_agent.progress_callback = progress_callback
+        previous_artifact_callback = self.artifacts.progress_callback
         previous_command_callback = getattr(self.workspace_tools, "command_event_callback", None)
         run_id = self.output_store.new_run_id()
         started = time.perf_counter()
+        memory_hits = self.memory.search(user_request, scope="global", limit=4)
+        request_context.setdefault("memory_hits", memory_hits)
+        self.memory.record_event("task_started", scope=f"run:{run_id}", metadata={
+            "request": user_request[:500], "architecture_memory_hits": len(memory_hits),
+        })
         self.workspace_tools.command_event_callback = progress_callback
+        self.artifacts.progress_callback = progress_callback
         try:
             graph_state = await run_task_graph(
                 self.master_agent,
@@ -234,6 +260,7 @@ class Orchestrator:
             )
         finally:
             self.master_agent.progress_callback = previous_callback
+            self.artifacts.progress_callback = previous_artifact_callback
             self.workspace_tools.command_event_callback = previous_command_callback
         result_items = graph_state.get("step_results", [])
         status = "success" if graph_state.get("status") == "completed" else "failure"
@@ -250,6 +277,36 @@ class Orchestrator:
                               if isinstance(candidate, dict) and candidate.get("model")
                               and str(candidate.get("model")) != str(selected_model_role)]
         network_report = self.network.report()
+        actual_tools: list[str] = []
+        for event in graph_state.get("trace", []):
+            tool = event.get("tool") if isinstance(event, dict) else None
+            if tool and str(tool) not in actual_tools:
+                actual_tools.append(str(tool))
+        for item in result_items:
+            coding_state = item.get("metadata", {}).get("coding_state", {}) if isinstance(item, dict) else {}
+            for command in coding_state.get("commands", []) if isinstance(coding_state, dict) else []:
+                if isinstance(command, dict) and "execute_command" not in actual_tools:
+                    actual_tools.append("execute_command")
+        trajectory = TrajectoryRecord(
+            task_id=run_id, actual_tools=actual_tools,
+            latency_ms=(time.perf_counter() - started) * 1000,
+            tokens=int(graph_state.get("token_count", 0) or 0),
+            completed=graph_state.get("status") == "completed",
+            retries=len(graph_state.get("repair_history", []) or []),
+        )
+        trajectory_score = trajectory.score()
+        self.evaluations.record(EvaluationRecord(
+            task_id=run_id, expected=None, actual=graph_state.get("final_answer", ""),
+            correctness=1.0 if trajectory.completed else 0.0,
+            latency_ms=trajectory.latency_ms, token_usage=trajectory.tokens,
+            tool_errors=len(graph_state.get("errors", []) or []),
+            recovered=trajectory.retries > 0 and trajectory.completed,
+            metadata={"trajectory": trajectory_score, "tools": actual_tools},
+        ))
+        self.memory.record_event("task_finished", scope=f"run:{run_id}", metadata={
+            "status": graph_state.get("status"), "latency_ms": trajectory.latency_ms,
+            "tool_count": len(actual_tools), "retries": trajectory.retries,
+        })
         telemetry = self.telemetry_store.record(
             run_id=run_id, task_type=str(task_data.get("domain_intent") or task_data.get("operation") or "general"),
             required_capabilities=list(task_data.get("required_capabilities", []) or []),
@@ -298,6 +355,7 @@ class Orchestrator:
             "started_at": datetime.now(timezone.utc).isoformat(),
             "completed_at": datetime.now(timezone.utc).isoformat(),
             "telemetry": telemetry,
+            "trajectory": trajectory_score,
         }
         trace = [{"timestamp": datetime.now(timezone.utc).isoformat(), "step": e.get("event", "master"),
                   "message": e.get("event", "master"), "metadata": e} for e in graph_state.get("trace", [])]
@@ -316,6 +374,7 @@ class Orchestrator:
             "final_answer": final_answer,
             "preprocessing": graph_state.get("preprocessing", {}),
             "agent_results": result_items,
+            "artifacts": graph_state.get("artifacts", []),
             "master_plan": graph_state.get("plan", []),
             "verification": graph_state.get("verification", {}),
             # Internal retry history remains in telemetry/trace, but a
@@ -364,6 +423,12 @@ class Orchestrator:
             reg.register(document_tool, tags=["document", "local", "read_only"])
         for vision_tool in self.vision_runtime.as_langchain_tools():
             reg.register(vision_tool, tags=["vision", "local", "read_only"])
+        for artifact_tool in self._artifact_langchain_tools():
+            reg.register(artifact_tool, requires_approval=artifact_tool.name in {"create_presentation", "create_workbook", "edit_artifact"},
+                        tags=["artifact", "office", "local"],
+                        permissions={"read": True, "write": artifact_tool.name != "validate_artifact", "delete": False,
+                                     "network": False, "external_side_effect": False,
+                                     "credential_access": False, "system_access": False})
         reg.register(self._official_document_tool(), requires_approval=True,
                      tags=["document", "official", "approval"],
                      permissions={"read": False, "write": True, "delete": False,
@@ -371,6 +436,30 @@ class Orchestrator:
                                   "credential_access": False, "system_access": False},
                      reversible=False)
         return reg
+
+    def _artifact_langchain_tools(self):
+        """Expose the deterministic artifact service in the canonical registry."""
+        @tool("create_presentation")
+        def create_presentation(spec: dict[str, Any], output_path: str = "") -> dict[str, Any]:
+            """Create and validate a local PowerPoint from a structured specification."""
+            return self.artifacts.create_presentation(spec, output_path or None)
+
+        @tool("create_workbook")
+        def create_workbook(spec: dict[str, Any], output_path: str = "") -> dict[str, Any]:
+            """Create and validate a local Excel workbook from a structured specification."""
+            return self.artifacts.create_workbook(spec, output_path or None)
+
+        @tool("edit_artifact")
+        def edit_artifact(source_path: str, operations: list[dict[str, Any]], output_path: str = "") -> dict[str, Any]:
+            """Edit a local PPTX or XLSX using supported deterministic operations."""
+            return self.artifacts.edit(source_path, operations, output_path or None)
+
+        @tool("validate_artifact")
+        def validate_artifact(path: str, expected: dict[str, Any] | None = None) -> dict[str, Any]:
+            """Validate a local PPTX or XLSX and return structured evidence."""
+            return self.artifacts.validate(path, expected)
+
+        return [create_presentation, create_workbook, edit_artifact, validate_artifact]
 
     def _official_document_tool(self):
         workflow = self.official_documents

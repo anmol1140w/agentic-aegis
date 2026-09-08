@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from aegis.contracts import Capability, ExecutionPlan, PlanStep, PlanValidator
+from aegis.contracts import Capability, ExecutionPlan, GoalBudget, GoalSpec, PlanStep, PlanValidator
 from aegis.governance import AuditChain
 from aegis.sovereign import (A2AGateway, A2AMessage, DSPyProgram, FederatedInference,
                              KubernetesPlanner, SovereignExecutor, TEEVerifier,
@@ -68,3 +68,16 @@ async def test_sovereign_execution_denied_tool_never_invokes_executor(tmp_path: 
     plan = ExecutionPlan(steps=[PlanStep(id="delete", capability=Capability.TOOL, tool="delete records")])
     result = await SovereignExecutor(PlanValidator(), AuditChain(tmp_path / "audit.jsonl")).execute(plan, executor=should_not_run)
     assert not result["passed"] and not called
+
+
+@pytest.mark.asyncio
+async def test_goal_budget_is_enforced_before_execution(tmp_path: Path):
+    with pytest.raises(ValueError, match="step budget"):
+        ExecutionPlan(
+            task_id="budgeted",
+            goal=GoalSpec(objective="bounded work", budget=GoalBudget(max_steps=1)),
+            steps=[
+                PlanStep(id="one", capability=Capability.TOOL),
+                PlanStep(id="two", capability=Capability.TOOL, depends_on=["one"]),
+            ],
+        )

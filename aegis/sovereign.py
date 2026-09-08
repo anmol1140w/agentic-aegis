@@ -269,8 +269,23 @@ class SovereignExecutor:
         started = time.perf_counter()
         self.audit.append("execution_started", task_id=plan.task_id, execution_id=execution_id, trace_id=trace_id)
         ordered = self._ordered(plan)
+        budget = plan.goal.budget if plan.goal else None
+        if budget and len(ordered) > budget.max_steps:
+            result = {"execution_id": execution_id, "trace_id": trace_id, "passed": False,
+                      "error": "goal step budget exceeded", "steps": [],
+                      "latency_ms": round((time.perf_counter() - started) * 1000, 3),
+                      "audit_valid": self.audit.verify()}
+            self.audit.append("execution_finished", task_id=plan.task_id, execution_id=execution_id, passed=False,
+                              reason="goal_step_budget_exceeded")
+            return result
         results: list[dict[str, Any]] = []
         for step in ordered:
+            if budget and time.perf_counter() - started > budget.max_wall_time_seconds:
+                results.append({"step_id": step.id, "ok": False, "error": "goal wall-time budget exceeded"})
+                break
+            if budget and len(results) >= budget.max_steps:
+                results.append({"step_id": step.id, "ok": False, "error": "goal step budget exceeded"})
+                break
             risk = self.approvals.assess(step)
             if risk.requires_approval and not (approval and approval(risk, step)):
                 result = {"step_id": step.id, "ok": False, "error": "risk-based approval denied", "risk": asdict(risk)}
@@ -283,7 +298,9 @@ class SovereignExecutor:
                 if not verified.verified:
                     results.append({"step_id": step.id, "ok": False, "error": "TEE attestation rejected", "attestation": asdict(verified)}); break
             route = self._route(step)
-            attempts = max(1, int(step.metadata.get("retries", 0)) + 1)
+            requested_retries = int(step.metadata.get("retries", 0))
+            allowed_retries = min(requested_retries, budget.max_retries if budget else requested_retries)
+            attempts = max(1, allowed_retries + 1)
             result: dict[str, Any] = {}
             for attempt in range(1, attempts + 1):
                 if step.metadata.get("delegate_to") and self.transport:
@@ -293,6 +310,8 @@ class SovereignExecutor:
                     raw = executor(step)
                     raw = await raw if asyncio.iscoroutine(raw) else raw
                 result = dict(raw or {})
+                if budget and len(results) >= budget.max_tool_calls:
+                    result = {"ok": False, "error": "goal tool-call budget exceeded"}
                 result.update({"step_id": step.id, "risk": asdict(risk), "route": route, "attempt": attempt})
                 result["verification"] = verify_tool_result(result)
                 result["evidence_verification"] = EvidenceVerifier.verify(step, result)

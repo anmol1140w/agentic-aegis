@@ -30,6 +30,25 @@ class PlanStep(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
+class GoalBudget(BaseModel):
+    """Hard resource limits for goal pursuit and recovery."""
+    max_steps: int = Field(default=32, ge=1, le=10_000)
+    max_tool_calls: int = Field(default=64, ge=0, le=100_000)
+    max_retries: int = Field(default=2, ge=0, le=100)
+    max_wall_time_seconds: float = Field(default=900.0, gt=0, le=86_400)
+    max_tokens: int | None = Field(default=None, ge=1, le=10_000_000)
+
+
+class GoalSpec(BaseModel):
+    """Human-owned objective, acceptance criteria, constraints, and budget."""
+    objective: str = Field(min_length=1, max_length=20_000)
+    success_criteria: list[str] = Field(default_factory=list, max_length=100)
+    constraints: list[str] = Field(default_factory=list, max_length=100)
+    budget: GoalBudget = Field(default_factory=GoalBudget)
+    risk: str = Field(default="low", pattern=r"^(low|medium|high|critical)$")
+    human_authority: str = "human remains accountable for high-impact actions"
+
+
 class ExecutionPlan(BaseModel):
     """A serialisable, dependency-aware execution plan."""
 
@@ -37,12 +56,15 @@ class ExecutionPlan(BaseModel):
     task_id: str = ""
     steps: list[PlanStep] = Field(min_length=1)
     metadata: dict[str, Any] = Field(default_factory=dict)
+    goal: GoalSpec | None = None
 
     @model_validator(mode="after")
     def unique_ids(self) -> "ExecutionPlan":
         ids = [step.id for step in self.steps]
         if len(ids) != len(set(ids)):
             raise ValueError("execution plan contains duplicate step ids")
+        if self.goal and len(self.steps) > self.goal.budget.max_steps:
+            raise ValueError("execution plan exceeds the goal step budget")
         return self
 
 
